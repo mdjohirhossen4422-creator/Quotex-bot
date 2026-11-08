@@ -116,6 +116,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `ml_validate.py` | purged walk-forward + permutation importance + random-walk control on v2 features |
 | `invert.py` | is the signal anti-predictive? policy chosen on train, frozen, applied to test |
 | `meta.py` | meta-labeling gate: learn P(win) for each engine signal, keep only the confident ones (pooled walk-forward + controls) |
+| `combine.py` | combine EVERY source (base+v2+patterns+order flow+engines) into one model, honestly scored; `--zoo`/`--search` show the overfitting trap |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
 | `run_dashboard.sh` | starts the dashboard on the public work host |
@@ -153,6 +154,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_intelligence.py` | intelligence read shape, causality, and the random-walk negative control |
 | `test_features_v2.py` | feature shape/uniqueness, label correctness, causality, random-walk control |
 | `test_meta.py` | meta-labeling gate: causal signal collection, pooled + per-pair controls, batch/single agreement |
+| `test_combine.py` | combine.py: label correctness, causality, coin-flip control, no-edge and learnable-edge controls |
 
 ## P0/P1 — provenance, payout, and the validation harness (2026-11-07)
 
@@ -811,3 +813,72 @@ model per period per scan pass, so a gated scan stays a few seconds.
     python meta.py --period 5 --engine rule --mode per_pair    # per-pair folds
     python scan.py 5,15 --gate --top 20                        # gated live scan
     python test_meta.py
+
+## "Combine everything" — still no edge (2026-11-08)
+
+`combine.py` is the direct answer to "use every signal at once." It builds one
+feature row per candle from **every** block the repo has:
+
+| block | size | source |
+|---|---|---|
+| base | 26 | `features.FEATURES` (returns, geometry, EMA/RSI/MACD/Stoch/BB/ATR) |
+| v2 | 20 | `features_v2.EXTRA_FEATURES` (structure, liquidity, regime, zones) |
+| pattern | 1 | `patterns.pattern_vote` (H&S, double, triangle, S/R, flag) |
+| order flow | 9 | `tickflow` tick features + a "has ticks" flag |
+| engines | 6 | rule/smart/ensemble direction + strength (`--engines`) |
+
+Label = next candle closed higher. Judged by pooled purged walk-forward over all
+62 OTC pairs, sorted by candle time, against the 54.05% breakeven.
+
+**5s, 62 pairs, 33k rows, gbm, 56 features:**
+validation 52.2%, held-out test **52.6% CI[51.1,54.2] → INDISTINGUISHABLE**.
+**15s:** test 52.2% CI[50.6,53.8] → BELOW. **With engine votes (62 feats):**
+test 51.6% → BELOW. The coin-flip control sits at ~50%.
+
+**The zoo** (`--zoo`) — every feature-subset x model family — lands 50.9–53.7%,
+every CI straddling or below the breakeven:
+
+    variant                 feat    val%   test%           test CI  verdict
+    base(26)/logit            26    51.3    53.7   [52.2,55.2]  indist.
+    base+v2+pattern(47)/rf    47    51.6    53.2   [51.7,54.7]  indist.
+    ALL(+orderflow)/gbm       56    50.8    51.7   [50.1,53.2]  below
+    ALL(+orderflow)/logit     56    51.8    53.0   [51.5,54.5]  indist.
+
+Note the pattern: **adding features does not help.** The full 56-feature stack is
+no better than the 26 base features — a random walk has no extra structure to
+mine. The `logit` column sits highest purely by a hair, not by a real edge.
+
+**Why "keep going until 55%" cannot work** (`--search N`). Randomly trying N
+feature subsets and keeping the one that scores best on a validation split is
+guaranteed to *find* a 55% by chance — that is the multiple-comparisons trap this
+repo has fallen into before (§6 threshold sweep, §7 confluence, the 49-hypothesis
+study). `combine.py --search` does exactly that search and reports how many
+candidates clear 55% on validation **vs** on the untouched held-out split:
+
+    python combine.py --period 5 --search 250 --max-candles 300
+    candidates >=55% on validation : 0
+    candidates >=55% on held-out   : 0
+    best-on-validation : rf 3 feats   val 53.5%  ->  TEST 54.0% CI[52.2,55.8]
+
+Even a 250-candidate search does not produce a 55% here, and the best-on-validation
+candidate still lands at the breakeven on the honest test — its CI includes it.
+On a feed that *did* have a searchable artefact you would see many candidates clear
+55% on validation and ~none on test; that gap is the whole lesson.
+
+**Controls prove the machinery works** (`test_combine.py`): causality (tampering
+with future candles leaves the present row unchanged), label correctness, a
+coin-flip control at 50%, no-edge data yielding no edge, and a synthetic
+learnable edge lifted to 89% on test. So the flat live result is the data, not
+the code.
+
+    python combine.py --period 5                       # honest verdict, all blocks
+    python combine.py --period 5 --engines             # + the 3 engine votes
+    python combine.py --period 5 --zoo                 # feature subsets x families
+    python combine.py --period 5 --search 250          # the overfitting demo
+    python test_combine.py
+
+Bottom line: combining every source — indicators, structure, SMC, patterns, order
+flow, and the engines themselves — does not move the hit-rate past the payout
+breakeven. That is the measured truth of this feed, and no amount of feature
+stacking or validation-tuning changes it. The honest levers left are more data on
+long timeframes and non-OTC pairs in real market hours.
