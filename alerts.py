@@ -179,12 +179,14 @@ def should_alert(prev: dict, res, cooldown: float, now: float) -> bool:
 def scan_once(store: CandleStore, periods: list[int], min_score: int,
               token: str, chat: str, state: dict, cooldown: float,
               dry: bool, engine: str = "rule", min_conf: float = 0.5,
-              expiry: int = 1) -> int:
+              expiry: int = 1, gate: bool = False,
+              gate_threshold: float = 0.55) -> int:
     """One pass over every (pair, timeframe); alert on new signals only."""
     now = time.time()
     sent = 0
     rep = scan_all(store, periods, engine, include_neutral=True,
-                   expiry_candles=expiry)
+                   expiry_candles=expiry, gate=gate,
+                   gate_threshold=gate_threshold)
     for row in rep["signals"]:
         if row["action"] == "NEUTRAL":
             continue
@@ -224,6 +226,10 @@ def main():
                     help="expiry in candles after entry, shown in the alert")
     ap.add_argument("--engine", choices=["rule", "smart"], default="rule",
                     help="rule = indicator votes; smart = regime + volatility")
+    ap.add_argument("--gate", action="store_true",
+                    help="meta-labeling filter: drop signals the model expects to lose")
+    ap.add_argument("--gate-threshold", type=float, default=0.55,
+                    help="keep a signal when meta P(win) >= this (default 0.55)")
     ap.add_argument("--cooldown", type=float, default=300,
                     help="seconds before repeating the same signal")
     ap.add_argument("--interval", type=float, default=20, help="scan interval (s)")
@@ -269,7 +275,7 @@ def main():
     if args.once:
         n = scan_once(store, periods, args.min_score, token, chat, state,
                       args.cooldown, args.dry_run, args.engine, args.min_conf,
-                      args.expiry)
+                      args.expiry, args.gate, args.gate_threshold)
         save_state(state)
         print(f"done — {n} alert(s)")
         return
@@ -278,7 +284,7 @@ def main():
         while True:
             scan_once(store, periods, args.min_score, token, chat, state,
                       args.cooldown, args.dry_run, args.engine, args.min_conf,
-                      args.expiry)
+                      args.expiry, args.gate, args.gate_threshold)
             save_state(state)
             time.sleep(args.interval)
     except KeyboardInterrupt:

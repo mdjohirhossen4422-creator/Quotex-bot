@@ -129,6 +129,10 @@ PAGE = """<!doctype html>
         </div>
         <button class="sbtn" id="scanGo">Scan now</button>
       </div>
+      <label style="margin-top:10px;display:flex;align-items:center;gap:8px;font-size:12px">
+        <input type="checkbox" id="scanGate" style="width:auto">
+        Meta-labeling filter (keep only signals the model expects to win)
+      </label>
       <div id="scanHint" class="mut" style="margin-top:8px;font-size:12px">
         runs the current engine over every stored pair at once</div>
       <div id="scanList"></div>
@@ -201,16 +205,19 @@ async function scanAll(){
   scanning=true;
   const tfs=document.getElementById('scanTf').value;
   const eng=document.getElementById('engine').value;
+  const gate=document.getElementById('scanGate').checked;
   const btn=document.getElementById('scanGo'); btn.disabled=true;
   document.getElementById('scanHint').textContent='scanning every pair…';
   const t0=performance.now();
   try{
-    const r=await fetch('/api/scan?periods='+encodeURIComponent(tfs)+'&engine='+eng);
+    const r=await fetch('/api/scan?periods='+encodeURIComponent(tfs)+'&engine='+eng
+      +'&gate='+(gate?'1':'0'));
     const j=await r.json();
     const ms=Math.round(performance.now()-t0);
     const scope=tfs==='all'?'all timeframes':tfs.replace(/,/g,'s, ')+'s';
+    const gtxt=j.gate?(' · meta-gated ('+j.gated_out+' dropped)'):'';
     document.getElementById('scanHint').textContent=
-      j.scanned+' series · '+j.ready+' ready · '+j.signal_count+' signals · '+ms+' ms ('+scope+')';
+      j.scanned+' series · '+j.ready+' ready · '+j.signal_count+' signals'+gtxt+' · '+ms+' ms ('+scope+')';
     const el=document.getElementById('scanList');
     if(!j.signals.length){el.innerHTML='<div class="mut" style="padding:10px 0">no signal right now — most candles are noise</div>';return;}
     el.innerHTML=j.signals.map(s=>{
@@ -544,8 +551,14 @@ class Handler(BaseHTTPRequestHandler):
                 top = int((q.get("top") or ["60"])[0])
             except ValueError:
                 top = 60
+            gate = (q.get("gate") or ["0"])[0] in ("1", "true", "yes", "on")
+            try:
+                gth = float((q.get("gate_threshold") or ["0.55"])[0])
+            except ValueError:
+                gth = 0.55
             from scan import parse_periods, scan_all
-            rep = scan_all(self.hub.store, parse_periods(spec), engine, top=top)
+            rep = scan_all(self.hub.store, parse_periods(spec), engine, top=top,
+                           gate=gate, gate_threshold=gth)
             return self._json(rep)
         if u.path == "/api/golive":
             q = parse_qs(u.query)

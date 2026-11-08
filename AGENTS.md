@@ -115,6 +115,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `features_v2.py` | base features + structure/liquidity/regime/zone features (causal) |
 | `ml_validate.py` | purged walk-forward + permutation importance + random-walk control on v2 features |
 | `invert.py` | is the signal anti-predictive? policy chosen on train, frozen, applied to test |
+| `meta.py` | meta-labeling gate: learn P(win) for each engine signal, keep only the confident ones (pooled walk-forward + controls) |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
 | `run_dashboard.sh` | starts the dashboard on the public work host |
@@ -151,6 +152,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_decision.py` | weighted voting, EV gate, every NO TRADE condition, reliability weights |
 | `test_intelligence.py` | intelligence read shape, causality, and the random-walk negative control |
 | `test_features_v2.py` | feature shape/uniqueness, label correctness, causality, random-walk control |
+| `test_meta.py` | meta-labeling gate: causal signal collection, pooled + per-pair controls, batch/single agreement |
 
 ## P0/P1 — provenance, payout, and the validation harness (2026-11-07)
 
@@ -738,3 +740,74 @@ Measured (2026-11-07, payout 0.85, breakeven 54.05%):
 That is the correct, honest outcome: the tooling now *proves* the absence of an
 edge instead of inventing one. Re-run `ml_validate.py` after collecting days of
 history; do not tune on these small per-pair samples.
+
+## Meta-labeling gate (`meta.py`, 2026-11-08)
+
+A different *kind* of idea from every earlier phase. Phases 1–11 all tried to
+make the engine predict better (new indicators, SMC, patterns, ML, order flow).
+Meta-labeling accepts the engine's direction as given and asks a narrower,
+easier question: **given that the engine fired, how likely is this particular
+signal to win?** Signals whose predicted win-probability is below a threshold are
+dropped. The gate can only remove signals, never flip a direction, so it cannot
+manufacture a signal that was not there.
+
+Why this is the right last tool to try: it does not need the returns to be
+predictable (they are not, see §2). It only needs the engine's *mistakes* to be
+separable from its *wins* in feature space — a much weaker requirement. A
+random-walk control proves the machinery will not invent separability that is not
+there.
+
+How it works (`meta.collect_signals`): replay an engine over each series, and for
+every signal record a feature row = the engine's own read (score, action sign) +
+the base causal feature vector (+ the `features_v2` block when available), and the
+label = did the next candle's close move the signal's way. Rows are strictly
+causal — the feature at index `i` uses candles `[0..i]` only.
+
+`meta.evaluate_gate` then judges it honestly with purged walk-forward:
+
+- **pooled** (default): all pairs' signals are merged and sorted by candle time,
+  and folds are cut by *time*, so a fold trains only on signals that happened
+  before the ones it is tested on. Pooling is what makes the sample usable — a
+  single pair has far too few signals. The model is global (one for all pairs).
+- **per_pair**: each series gets its own folds and model (needs many signals per
+  pair to mean anything).
+
+A test signal is kept when P(win) >= threshold; kept test signals are pooled and
+compared against the ungated baseline on the *same* test signals, with a Wilson
+CI. Folds with too little training data keep everything (no data to learn from).
+
+**Controls (the whole point).** `python meta.py --control` proves the gate can
+find a real edge and refuses to find a fake one:
+
+    [negative] random labels : engine 50.4%  gated 49.4%  (gain -1.0 pp, coverage 17%)
+    [positive] learnable edge: engine 51.9%  gated 85.8%  (gain +33.9 pp, coverage 45%)
+
+The positive control is a synthetic signal whose win/loss is a learnable function
+of a feature the model can see; the gate lifts it from ~52% to ~86%. The negative
+control is random labels; the gate gains ~0. So a precision gain on live data
+would be real, not an artifact.
+
+**Live result (2026-11-08, 5s OTC, payout 0.85, breakeven 54.05%).** Only a few
+hundred signals had accumulated, so this is *not yet* a verdict:
+
+    engine   all     gated    coverage   gain      p
+    rule     49.3%   53.0%    38.6%      +3.7 pp   CI straddles breakeven
+    ensemble 50.6%   49.3%    35.4%      -1.3 pp   gating hurt
+    smart    53.9%   52.5%    34.8%      -1.4 pp   gating hurt
+
+The rule engine's +3.7 pp is *not* significant — with 83 kept signals the CI
+[42.4, 63.4] still contains the breakeven, exactly like every earlier "win" in
+this repo. The ensemble and smart gates slightly *hurt*. So: **no measured edge
+yet; collect far more signals and re-run.** `power.py` says a 55% edge needs
+~22,000 decisive signals — the gate is a lever, not a shortcut.
+
+Wire-up: `scan.py --gate [--gate-threshold T]`, the dashboard scan card's
+"Meta-labeling filter" checkbox (`/api/scan?gate=1`), and `alerts.py --gate`.
+The gate pools by *period* (a 5s model never scores a 60s signal) and fits one
+model per period per scan pass, so a gated scan stays a few seconds.
+
+    python meta.py --period 5 --engine rule --source otc     # honest walk-forward
+    python meta.py --control                                  # prove the machinery
+    python meta.py --period 5 --engine rule --mode per_pair    # per-pair folds
+    python scan.py 5,15 --gate --top 20                        # gated live scan
+    python test_meta.py

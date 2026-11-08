@@ -29,6 +29,7 @@ import time
 
 from analysis import analyze, analyze_smart, analyze_ensemble
 from candle_store import CandleStore, PERIODS
+from payout import DEFAULT_PAYOUT
 
 PERIOD_LABEL = {5: "5s", 15: "15s", 30: "30s", 60: "1m",
                 120: "2m", 300: "5m", 600: "10m", 900: "15m"}
@@ -87,7 +88,8 @@ def _is_dead(candles: list[list], window: int = 20) -> bool:
 def scan_all(store: CandleStore, periods: list[int], engine: str = "rule",
              top: int = 0, include_neutral: bool = False,
              min_candles: int = 0, expiry_candles: int = 1,
-             skip_dead: bool = True) -> dict:
+             skip_dead: bool = True, gate: bool = False,
+             gate_threshold: float = 0.55, payout: float = DEFAULT_PAYOUT) -> dict:
     """Run the engine over every (pair, timeframe) and return a ranked report.
 
     Returns a plain dict so the dashboard, the CLI, and the alert loop can all
@@ -98,6 +100,12 @@ def scan_all(store: CandleStore, periods: list[int], engine: str = "rule",
 
     `skip_dead` drops pairs whose last N candles never moved (real-market pairs
     while the market is closed). They produce only flat, meaningless signals.
+
+    `gate=True` adds the meta-labeling filter (`meta.live_gate`): each fired
+    signal is scored by a model trained on that pair's earlier signals, and
+    dropped when its predicted win-probability is below `gate_threshold`. This
+    can only remove signals, never change a direction. Rows carry the gate's
+    `p_win` so the effect is visible.
     """
     fn = analyze_smart if engine == "smart" else (analyze_ensemble if engine == "ensemble" else analyze)
     pairs = store.series(min_candles=min_candles, periods=periods)
@@ -116,11 +124,53 @@ def scan_all(store: CandleStore, periods: list[int], engine: str = "rule",
 
     signals = [(r, t) for r, t in fired if r.action != "NEUTRAL"]
     signals.sort(key=lambda rt: (-abs(rt[0].score), rt[0].asset, rt[0].period))
+
+    gated_out = 0
+    if gate:
+        from meta import collect_signals, live_gate_batch, GATE_MAX_CANDLES
+        # Pool by (period): candle intervals differ across timeframes, so a model
+        # trained on 5s signals must not score 60s ones. For each period, build
+        # signal tables once for every fired pair, then gate them all with a
+        # single pooled model (one fit per period, not one per signal).
+        by_period: dict[int, list] = {}
+        for r, t in signals:
+            by_period.setdefault(r.period, []).append((r, t))
+        decisions: dict[tuple[str, int], object] = {}
+        for period, items in by_period.items():
+            tables: dict[str, list] = {}
+            for r, _t in items:
+                if r.asset in tables:
+                    continue
+                cs = store.load(r.asset, period, limit=GATE_MAX_CANDLES)
+                rows = collect_signals(engine, r.asset, cs)
+                if rows:
+                    tables[r.asset] = rows
+            try:
+                for asset, g in live_gate_batch(
+                        tables, threshold=gate_threshold).items():
+                    decisions[(asset, period)] = g
+            except Exception:
+                pass
+        kept = []
+        for r, t in signals:
+            g = decisions.get((r.asset, r.period))
+            if g is None:
+                kept.append((r, t, None))       # not enough history: keep as-is
+            elif g.keep:
+                kept.append((r, t, g))
+            else:
+                gated_out += 1
+        signals = [(r, t) for r, t, _ in kept]
+        gate_meta = {(r.asset, r.period): g for r, _, g in kept}
+    else:
+        gate_meta = {}
+
     rows = signals if not include_neutral else signals + [
         (r, t) for r, t in fired if r.action == "NEUTRAL"]
 
     def row(r, last_time):
         plan = entry_plan(r.period, last_time, now, expiry_candles)
+        g = gate_meta.get((r.asset, r.period))
         return {
             "asset": r.asset, "period": r.period,
             "label": PERIOD_LABEL.get(r.period, f"{r.period}s"),
@@ -128,6 +178,8 @@ def scan_all(store: CandleStore, periods: list[int], engine: str = "rule",
             "bull": r.bull, "bear": r.bear,
             "regime": r.regime, "confidence": r.confidence,
             "candles": r.candles, "reasons": r.reasons,
+            "gate": (None if g is None else {"p_win": round(g.p_win, 4),
+                                             "n_train": g.n_train}),
             **plan,
         }
 
@@ -139,6 +191,8 @@ def scan_all(store: CandleStore, periods: list[int], engine: str = "rule",
         "ready": len(fired),
         "waiting": waiting,
         "dead": dead,
+        "gate": gate,
+        "gated_out": gated_out,
         "signal_count": len(signals),
         "signals": [row(r, t) for r, t in (rows[:top] if top else rows)],
     }
@@ -197,6 +251,10 @@ def main():
     ap.add_argument("--expiry", type=int, default=1, metavar="N",
                     help="expiry in candles after entry (default 1)")
     ap.add_argument("--json", action="store_true", help="print JSON, not a table")
+    ap.add_argument("--gate", action="store_true",
+                    help="meta-labeling filter: drop signals the model expects to lose")
+    ap.add_argument("--gate-threshold", type=float, default=0.55,
+                    help="keep a signal when meta P(win) >= this (default 0.55)")
     ap.add_argument("--watch", action="store_true",
                     help="re-scan every 30s until Ctrl-C")
     args = ap.parse_args()
@@ -212,7 +270,8 @@ def main():
         rep = scan_all(store, periods, args.engine,
                        top=args.top, include_neutral=args.all,
                        min_candles=args.min_candles,
-                       expiry_candles=args.expiry)
+                       expiry_candles=args.expiry,
+                       gate=args.gate, gate_threshold=args.gate_threshold)
         if args.json:
             print(json.dumps(rep, indent=2))
         else:
