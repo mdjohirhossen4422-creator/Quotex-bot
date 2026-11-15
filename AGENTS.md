@@ -974,3 +974,60 @@ So this bot makes the process honest and consistent; it does not manufacture an
 edge. Whether it has one is answered by `journal.py --engine discipline`, never
 assumed. `test_discipline.py` pins every gate, the abstain-by-default behaviour,
 the candidate-vs-signal rule, the no-fabricated-EV rule, and the gap stop.
+
+## Phase 1 — Data Engine Audit (`data_audit.py`, 2026-11-08)
+
+Read-only audit of the store. It opens SQLite with `mode=ro` (a write attempt is
+refused — pinned by `test_data_audit.py::test_audit_never_writes`), so it can
+never mutate the durable database. Run it any time:
+
+    python data_audit.py                       # human report
+    python data_audit.py --json                # machine-readable
+    python data_audit.py --consistency EURUSD_otc 60   # candle-vs-tick diff
+
+**Result on the live store (298,207 candles / 1,716,041 ticks, 91 pairs):**
+
+| check | result |
+|---|---|
+| candles: invalid OHLC | 0 |
+| candles: time % period != 0 | 0 |
+| candles: duplicate (asset,period,time) | 0 (PK enforces it) |
+| candles: null source / feed_id | 0 / 0 |
+| candles: source↔symbol mismatch | 0 |
+| candles: frozen rate | otc 0.6%, real 100% (market closed) |
+| ticks: bad price / bad ts / future ts | 0 / 0 / 0 |
+| ticks: null source / feed_id | 0 / 0 |
+| ticks: exact duplicate rows | 0 |
+| ticks: ts monotonic per asset | all 91 OK |
+
+**Findings that matter (no old data was changed):**
+
+1. **`ticks` has no UNIQUE constraint and `save_ticks` uses plain `INSERT`.**
+   Today the table is clean (0 exact dups, 0 non-monotonic ts), but `MultiFeed`
+   reconnects and replays the socket, so a re-sent frame after a drop would be
+   stored twice. Fix is additive and safe (do it in a later phase, with your OK):
+   `CREATE UNIQUE INDEX IF NOT EXISTS ticks_unique ON ticks(asset, ts, price, dir)`
+   and switch `save_ticks` to `INSERT OR IGNORE`.
+2. **205 `(asset, ts)` pairs carry two different prices.** That is the feed
+   sending two quotes in the same millisecond (one price step), not corruption —
+   both are legitimate and belong in the raw stream. Worth knowing: the raw tick
+   stream is not strictly "one row per instant".
+3. **Candle↔tick mismatch is 1 bucket in 165** (EURUSD_otc 60s) and it is the
+   *open* only: the stored open (1.11027) is a mid-bucket tick, while the tick
+   table's first row (1.11022) is earlier. Cause: ticks and candles were
+   collected by different processes with different start points (candles begin
+   ~548 s before the first stored tick), so the very first bucket of a session
+   can be assembled from an incomplete tick set. Intra-session buckets agree
+   exactly (close/high/low all match). This is a *session-boundary* artifact,
+   not a live bug.
+4. **Coverage is gappy by design.** Each OTC 60s series has 2 gaps, the big one
+   ~630,060 s (7.3 days) — the collector was down. `discipline.py` already
+   handles this by scoring quality on the *recent contiguous run*, and
+   `data_audit.series_gaps()` reports `recent_run` for the same reason.
+5. **No collector is running right now** — the newest candle is ~12,700 s old,
+   so live data has stopped. Restart `collect_ticks.py` / the dashboard to resume.
+
+Verdict: the data engine is **structurally sound** (schema, provenance,
+validity, alignment all clean). The only latent risk is tick de-duplication on
+reconnect, which is a small, additive fix — deferred to Phase 2 pending your
+approval, per "do not change the working DB/code without permission".
