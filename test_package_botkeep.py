@@ -76,10 +76,30 @@ def test_preflight_treats_warn_as_non_fatal():
     print("PASS test_preflight_treats_warn_as_non_fatal")
 
 
+def test_trader_shim_runs_collector_status():
+    """The Botkeep egg runs `python trader.py`; the shim must forward to the
+    collector. `--status` is a no-feed path, so it is safe to run here."""
+    import subprocess
+    out = os.path.join(tempfile.mkdtemp(), "bundle.zip")
+    pk.build(out)
+    d = tempfile.mkdtemp()
+    zipfile.ZipFile(out).extractall(d)
+    assert os.path.exists(os.path.join(d, "trader.py")), "trader.py missing from ZIP"
+    r = subprocess.run([sys.executable, "trader.py", "--status"],
+                       cwd=d, capture_output=True, text=True, timeout=60,
+                       env={**os.environ,
+                            "CANDLE_DB": os.path.join(d, "data", "candles.db"),
+                            "COLLECTOR_STATE": os.path.join(d, "data", "state.json")})
+    assert r.returncode == 0, r.stderr
+    assert "no heartbeat yet" in r.stdout or "status" in r.stdout, r.stdout
+    print("PASS test_trader_shim_runs_collector_status")
+
+
 if __name__ == "__main__":
     test_secret_scanner_flags_assignments_not_mentions()
     test_forbidden_files_are_rejected()
     test_build_is_self_contained_and_clean()
     test_bundled_modules_import_from_archive()
     test_preflight_treats_warn_as_non_fatal()
+    test_trader_shim_runs_collector_status()
     print("\nall package-botkeep tests passed")

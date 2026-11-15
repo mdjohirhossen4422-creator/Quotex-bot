@@ -24,6 +24,7 @@ Everything sits at the archive root so Botkeep finds `requirements.txt` directly
 | `requirements.txt` | `websocket-client>=1.6,<2.0` (the only dependency) |
 | `requirements-collector.txt` | same pin, kept for reference |
 | `start.sh` | optional crash-restart supervisor |
+| `trader.py` | default entry point the Botkeep egg runs (`python trader.py`) |
 | `BOTKEEP_README.md` | fuller deploy notes |
 
 Deliberately **excluded**: `.env`, `telegram.json`, `payout.json`, `.git`,
@@ -40,7 +41,12 @@ Deliberately **excluded**: `.env`, `telegram.json`, `payout.json`, `.git`,
    python live_collector.py --no-ticks
    ```
 
-   or, to get a crash-restart loop, use the bundled supervisor:
+   If your egg does **not** let you edit the start command (the default egg
+   runs `python trader.py`), leave it as is — the ZIP ships a `trader.py` that
+   launches the same collector with `--no-ticks` automatically. Either command
+   works.
+
+   To get a crash-restart loop instead, use the bundled supervisor:
 
    ```
    bash start.sh

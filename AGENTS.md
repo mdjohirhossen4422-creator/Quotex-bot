@@ -1393,3 +1393,20 @@ public app/deploy route and no issued API tokens; `api.botkeep.cloud` returns
 AI Telegram remains **paper only**: `signal_telegram.py` defaults to
 `--mode paper`, and `--mode live` refuses unless `golive.gate()` reports
 LIVE-READY (currently NOT READY). The ZIP contains no Telegram code at all.
+
+### Botkeep egg runs `python trader.py` (2026-11-08)
+
+The Botkeep/Pterodactyl egg's default start command is `python trader.py`. The
+collector has no such file, so the first deploy crashed with
+`can't open file '/home/container/trader.py': [Errno 2]` and a restart loop.
+
+Fix: the ZIP ships a `trader.py` shim at the archive root. It sets sane defaults
+(`CANDLE_DB`/`COLLECTOR_STATE` under `/data` if present, else `./data`), creates
+the parent dirs, forces candle-only (`--no-ticks`) unless `COLLECTOR_STORE_TICKS=1`,
+forwards any extra argv, then calls `live_collector.main()`. So the egg's default
+command works with no panel change. `python live_collector.py --no-ticks` and
+`bash start.sh` also work if the panel allows editing the command.
+
+`start.sh` path fix: in the ZIP it sits at the root, so ROOT is now
+`$(dirname "$0")`, not `$(dirname "$0")/../..`. Verified with a stub python that
+a crash restarts (backoff) and a clean exit stops the loop.

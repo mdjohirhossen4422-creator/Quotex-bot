@@ -35,6 +35,7 @@ BUNDLE = [
     "storage_monitor.py",
     "requirements-collector.txt",
     "deploy/botkeep/start.sh",
+    "deploy/botkeep/trader.py",
 ]
 
 # Extra files copied in with a fixed destination name.
