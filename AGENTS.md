@@ -118,6 +118,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `meta.py` | meta-labeling gate: learn P(win) for each engine signal, keep only the confident ones (pooled walk-forward + controls) |
 | `combine.py` | combine EVERY source (base+v2+patterns+order flow+engines) into one model, honestly scored; `--zoo`/`--search` show the overfitting trap |
 | `pabot.py` | rule-based **indicator + price action + SMC** bot, NO training (instant); `--watch`, and engine `pa` in scan/dashboard/alerts |
+| `discipline.py` | **market-understanding + discipline** bot: a 7-gate checklist over data/regime/structure/confluence; abstains by default, "candidate" until the journal proves an edge |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
 | `run_dashboard.sh` | starts the dashboard on the public work host |
@@ -157,6 +158,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_meta.py` | meta-labeling gate: causal signal collection, pooled + per-pair controls, batch/single agreement |
 | `test_combine.py` | combine.py: label correctness, causality, coin-flip control, no-edge and learnable-edge controls |
 | `test_pabot.py` | pabot.py: offline reads, determinism, vote logic, causality, adapter shape, training-free check |
+| `test_discipline.py` | discipline.py: every gate, abstain-by-default, candidate-vs-signal, no fabricated EV, recent-run gap stop |
 
 ## P0/P1 — provenance, payout, and the validation harness (2026-11-07)
 
@@ -925,3 +927,50 @@ fast, explainable *presentation* of three classic readings — the same alert, n
 a proven trade. `test_pabot.py` proves the code is correct (offline reads,
 determinism, causality, adapter shape, and a source scan that forbids any
 ML/training import), so the flat live result is the data, not the bot.
+
+## Discipline + market-understanding bot (`discipline.py`, 2026-11-08)
+
+The honest half of "a bot beats a human." A human's real disadvantage is not
+signal generation — it is **discipline**: staying consistent, never
+revenge-trading, never tired, and holding a whole-market map at once. This bot
+attacks exactly that. Its default answer is **NO TRADE**; a signal is the
+exception. It runs an ordered 7-gate checklist and names the gate that blocked:
+
+| # | gate | module | fails when |
+|---|---|---|---|
+| 1 | data quality | `provenance.quality` (on the **recent contiguous run**) | gaps / frozen / spikes |
+| 2 | regime defined | `regime.classify` | transitional, ambiguous market |
+| 3 | structure directional | `structure.structure_state` | structure is a range |
+| 4 | confluence | `pabot` (indicator + price action + SMC) | < N families agree |
+| 5 | agreement | structure + regime | read fights the trend |
+| 6 | signal strength | `pabot` confidence | below the floor |
+| 7 | proven edge | `journal` (measured, not assumed) | < `min_settled` settled, or CI below breakeven |
+
+**The honesty rule that matters.** Gate 6 is *strength*, not a probability. The
+repo already proved the engine confidence is **not calibrated** (the 0.7–0.8
+bucket hit ~50%), so computing an EV from it is the "আন্দাজে" (guesswork) trap.
+This bot never fabricates an EV. Gate 7 is the real edge check: it reads the
+**live journal** of this bot's own signals and only calls a setup a **`signal`**
+once ≥30 decisive signals have settled with a Wilson CI lower bound above the
+payout breakeven and a positive payout-adjusted EV. Until then, a fully-passing
+setup is a **`candidate`** — good discipline, unproven edge. That is the truthful
+label, and it flips to `signal` only if the forward record earns it.
+
+    python discipline.py EURUSD_otc 60            # one series, full checklist
+    python discipline.py --scan 60                # every pair; only passers shown
+    python discipline.py --scan 60 --all          # show why each pair was rejected
+    python discipline.py --scan 60 --log          # + record passers for forward tracking
+    python journal.py --report --engine discipline  # the forward track record
+
+`_recent_run()` measures quality on the trailing contiguous session, not lifetime
+coverage — the feed was down for ~7 days at one point, which made a clean 60s
+session read as "98% gaps" on the whole history. That was a measurement bug, not
+a data problem, and the fix is the honest one.
+
+**What this does and does not claim.** Discipline is real: fewer signals, each
+one filtered by market state, and a self-measuring track record. But per AGENTS.md
+§6, being pickier does **not** raise the per-signal hit-rate — it only fires less.
+So this bot makes the process honest and consistent; it does not manufacture an
+edge. Whether it has one is answered by `journal.py --engine discipline`, never
+assumed. `test_discipline.py` pins every gate, the abstain-by-default behaviour,
+the candidate-vs-signal rule, the no-fabricated-EV rule, and the gap stop.

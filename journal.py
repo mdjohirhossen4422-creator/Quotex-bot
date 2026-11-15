@@ -228,7 +228,7 @@ def main():
     ap.add_argument("--db", default="data/candles.db")
     ap.add_argument("--journal", default="data/journal.db")
     ap.add_argument("--periods", default="5")
-    ap.add_argument("--engine", choices=["rule", "smart"], default="rule")
+    ap.add_argument("--engine", choices=["rule", "smart", "ensemble", "pa", "discipline"], default="rule")
     ap.add_argument("--expiry", type=int, default=1)
     ap.add_argument("--payout", type=float, default=0.85)
     ap.add_argument("--min-score", type=int, default=0,
