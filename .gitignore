@@ -5,3 +5,4 @@ data/
 out/
 telegram.json
 payout.json
+processed_data/

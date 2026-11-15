@@ -1031,3 +1031,73 @@ Verdict: the data engine is **structurally sound** (schema, provenance,
 validity, alignment all clean). The only latent risk is tick de-duplication on
 reconnect, which is a small, additive fix — deferred to Phase 2 pending your
 approval, per "do not change the working DB/code without permission".
+
+## Phase 2 — Historical data processing & feature engineering (2026-11-08)
+
+New `pipeline/` package turns the raw store into ML-ready datasets. It is
+**read-only on `data/candles.db`** (opened `mode=ro` + `PRAGMA query_only=1`, and
+pinned by `test_pipeline.py::test_source_db_read_only`) and **write-only to
+`processed_data/`**. The WebSocket, dashboard and every existing module are
+untouched.
+
+```bash
+python -m pipeline.run          # build every market x timeframe
+python -m pipeline.run --markets otc --timeframes 1m
+python -m pipeline.report       # the 18-point Phase 2 report
+python test_pipeline.py         # 26 tests (valid + intentionally-invalid inputs)
+```
+
+### What it does
+`pipeline/db.py` (chunked read-only access) → `candles.py` (build OHLC from ticks;
+open=first, high=max, low=min, close=last) → `cleaning.py` (validate, flag, never
+fabricate) → `features.py` / `tickfeat.py` / `structurefeat.py` → `dataset.py`
+(pool, labels, MTF) → `splits.py` (time-based) → `leakage.py` (checks) →
+`store.py` (Parquet + metadata).
+
+* **Timeframes:** 1m/5m/15m/30m, built from ticks; 30m is also built by
+  aggregating lower candles and cross-checked (`test_aggregate_candles_matches_ticks`).
+* **60 features**, all **scale-free** (a ratio or % of close) so instruments can
+  be pooled: trend (EMA9/21/50/200, SMA20/50 as % of close, EMA ratios/slopes),
+  momentum (RSI7/14, MACD, StochRSI), volatility (ATR%, Bollinger width/%B,
+  rolling std%), candle geometry, 13 tick/order-flow features, 12 market-structure
+  features (swings, S/R distance, BOS, CHoCH, sweep, FVG, order block, equal
+  levels, range position), and 4 multi-timeframe trend codes (trend_1m/5m/15m/30m).
+* **Labels:** 3-class next-candle DOWN/SIDEWAYS/UP with an **ATR-relative**
+  sideways band (`SIDEWAYS_ATR_MULT=0.25`), plus next_ret / next_range / next_dir
+  / label_ts. Labels are separate columns, never features.
+* **Splits:** chronological **by timestamp** (not by index — assets share
+  timestamps, so an index split contaminates). 70/15/15 with an embargo candle.
+  A per-row `split` column is stored.
+* **Leakage checks:** target-not-in-features, chronological order, no duplicate
+  (asset,time) keys, feature↔label correlation, and a future-permutation
+  causality check that is proven to fail on a deliberately leaky builder.
+
+### Honest results (2026-11-08, source: 1,716,041 ticks / 298,207 candles)
+
+| market | tf | usable rows | train/val/test | written |
+|---|---|---|---|---|
+| otc | 1m | 7,316 | 5084/1054/1054 | yes |
+| otc | 5m | 124 | 62/0/0 | yes |
+| real | 1m | 677 | 464/79/84 | yes |
+| real | 5m | 58 | 29/0/0 | yes |
+| otc/real | 15m, 30m | 0 | — | **no** |
+
+All leakage checks PASS on every written dataset; splits are disjoint and
+ordered. Processing 12.6 s, peak RSS 142 MB.
+
+**The bottleneck is history, not code.** Contiguous coverage is only ~2.2 h per
+instrument (168 1m candles; longest run 130). Consequences, reported not hidden:
+
+* **EMA200 is excluded** (needs 200 bars) — `features_unavailable` in metadata.
+* **15m and 30m have 0 usable rows** (only 13 / 7 candles exist). Not written.
+* **5m has too few rows for a val/test split** (62 train, 0 val, 0 test).
+* **Real pairs were frozen** (market closed) so their 1m candles are 100% flat →
+  ATR=0 → unlabelable; real 1m labels are all SIDEWAYS. Only **OTC 1m** has a
+  usable, balanced 3-class dataset today.
+
+The fix is to run `collect_ticks.py` for days, then re-run `pipeline.run`; the
+code needs no change. Do not train a model on 5m/15m/30m until coverage grows.
+
+Per-instrument feature rows are pooled and time-sorted (the intended ML layout);
+every row keeps its `asset`, `market_type`, `timeframe` and `split` columns, so
+grouping by instrument or split is a one-liner downstream.
