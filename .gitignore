@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 data/
 out/
+logs/
 telegram.json
 payout.json
 processed_data/

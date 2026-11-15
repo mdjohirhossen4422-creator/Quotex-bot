@@ -1101,3 +1101,71 @@ code needs no change. Do not train a model on 5m/15m/30m until coverage grows.
 Per-instrument feature rows are pooled and time-sorted (the intended ML layout);
 every row keeps its `asset`, `market_type`, `timeframe` and `split` columns, so
 grouping by instrument or split is a one-liner downstream.
+
+## Phase 2.5 — continuous live data collection (2026-11-15)
+
+A long-running, crash-tolerant collector that appends raw ticks and 1m/5m/15m/30m
+candles to `data/candles.db` **additively**. It never deletes, overwrites or
+modifies existing rows, and it does not touch any existing module: the feed comes
+from `market_qx_candles.MarketQX` (unchanged) and the schema from
+`candle_store.CandleStore` (unchanged). Only `provenance.classify_source` is
+reused, so real and OTC stay separated.
+
+| file | purpose |
+| --- | --- |
+| `live_collector.py` | the collector: subscribe to every pair, store ticks + candles, reconnect, heartbeat, daily report |
+| `collector_report.py` | read-only monitoring report (new ticks, candles per tf, real vs otc, gaps, duplicates, uptime/reconnects) |
+| `run_collector.sh` | supervised launcher (restart-on-crash, pidfile, logs) |
+| `test_live_collector.py` | 8 tests: dedup, no-fabrication, append-only, separation, restart safety |
+
+### How the four safety rules are enforced
+
+1. **No delete/overwrite/modify.** Ticks are a plain `INSERT`; candles are
+   `INSERT OR IGNORE` on the `(asset, period, time)` primary key. The schema is
+   only ever extended additively (`ALTER TABLE ADD COLUMN`). `test_existing_rows_never_modified`
+   proves a pre-existing row is byte-identical after a write.
+2. **No duplicate tick on reconnect.** Each tick is keyed `(asset, ts, price, dir)`.
+   An in-memory dedup set, **seeded at startup from the tail of the `ticks`
+   table**, drops any replay. `test_dedup_survives_restart_reseed` proves a
+   re-sent tick after a restart is dropped while a genuinely new one is kept.
+3. **No fabricated candle.** Candle builders are rebuilt on every (re)connect, so
+   the candle that was still forming across a gap is dropped, never written
+   half-built (`test_partial_candle_not_written_across_reconnect`). Missing data
+   and market closure simply produce fewer candles — nothing is invented.
+4. **Real and OTC separated.** Every row carries `source` (`otc`/`real`) via
+   `classify_source`; the report shows them separately and never pools them.
+
+### Run
+
+```bash
+./run_collector.sh                      # start (background), all 92 pairs, 4 timeframes
+./run_collector.sh --pairs EURUSD_otc,BTCUSD_otc
+./run_collector.sh --stop               # stop (flushes buffer, drops the forming candle)
+./run_collector.sh --status             # heartbeat: uptime, ticks_new, candles_new, dup, reconnects
+./run_collector.sh --report             # full monitoring report
+python collector_report.py --json       # machine-readable
+python collector_report.py --reset-baseline   # re-zero the "new since baseline" counters
+python test_live_collector.py           # 8/8
+```
+
+The collector writes `data/collector_state.json` (heartbeat, rewritten every 5s),
+`data/collector_reports/<date>.json` (once a day) and `logs/collector.log`.
+
+### Verified live (2026-11-15)
+
+* Feed reachable: 92 instruments; ~30k ticks / 4.5 min across 91 pairs.
+* Ingestion grows the DB: `ticks_new` and `candles_new` increase, `dup=0`.
+* **Restart is safe:** stop → counts unchanged (buffer flushed, 0 dup) → restart
+  → counts continue from where they were, still 0 duplicates.
+
+### Honest caveats
+
+* **30m needs 30 minutes of uptime before its first candle**, and 15m/30m need
+  many hours before they are usable — that is the feed, not a bug. Nothing is
+  fabricated to make them appear sooner.
+* The ~979k "large gaps" in the report are the ~7 days the collector was **off**
+  (the DB only had the old short sessions); a 7-day continuous run replaces those
+  with real coverage. Small gaps (`<= 20` buckets) are genuine feed hiccups.
+* No model, signal, Telegram or trading path is started here. This phase only
+  collects data; `pipeline.run` is what turns it into datasets, and it must be
+  re-run after the collector has built up history.
