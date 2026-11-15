@@ -1188,3 +1188,93 @@ Botkeep Free = 1 slot, 512 MB RAM, 0.5 vCore, **1 GB storage**, 24/7, no SLA.
 - Proposed Botkeep start command (pending approval):
   `python live_collector.py --no-ticks`, with `CANDLE_DB` / `COLLECTOR_STATE`
   pointing at the persistent path. No secret is needed to collect.
+
+## Phase 3 — AI Signal System (2026-11-08)
+
+Built in parallel with the Botkeep collector. Nothing trades; every number below
+is measured, not claimed.
+
+### Priority 1 — collector deploy artifacts
+`deploy/botkeep/README.md`: start command (`python live_collector.py
+--no-ticks`), env vars (`CANDLE_DB`, `COLLECTOR_STATE`, `COLLECTOR_STORE_TICKS=0`),
+the minimal file list, preflight, the storage guard, and the two checks that must
+run on the instance (redeploy persistence, 24 h uptime). Deployment itself is
+still pending your go-ahead — nothing is deployed.
+
+### Priority 2 — real and OTC stored separately
+Provenance already tags every row `otc` / `real` / `synthetic` from the symbol.
+`signal_data.SignalData` and every model key are per **source**; a real-market
+model is never trained on, scored with, or applied to OTC data (and vice versa).
+`test_ai_signal.py::test_sources_never_mix` asserts it.
+
+### Priority 3 — 1m / 5m / 15m / 30m candles
+The collector maintains exactly `CANDLE_PERIODS = [60, 300, 900, 1800]` and
+persists each closed candle. No fabrication: a bucket with no ticks is never
+written.
+
+### Priority 4 — tick order-flow kept as candle-level summaries
+`--no-ticks` no longer throws order flow away. `tick_summary.TickSummarizer`
+keeps 9 per-candle numbers (`tick_count`, `tick_up/down/flat`, `tick_dir_ratio`,
+`tick_momentum`, `tick_short_vol`, `tick_range`, `broker_dir_ratio`) on the candle
+row itself. Direction uses the ACTUAL price change, never the broker flag (kept
+only as its own feature). A summary is emitted only when a bucket rolls over, so
+nothing half-built leaks; reconnect drops the forming summary. Memory is O(periods)
+per asset. Verified live: `--no-ticks` run wrote 9 candles, 9 summaries, 0 ticks.
+
+### Priorities 5–8 — engine, training, honest backtest
+- `signal_features.py` — 35 causal features = 26 base (`features.py`) + 6 tick +
+  3 higher-TF. MTF uses only the last higher candle that had *fully closed*.
+- `ai_signal_engine.py` — CALL / PUT / **NO TRADE**. Model path when a
+  `models/<source>_<period>s.pkl` exists; transparent indicator+order-flow
+  heuristic otherwise. Abstains below `min_confidence`. Returns `analysis.Analysis`.
+  `entry_plan()` gives the next honest entry boundary + expiry.
+- `train_signal_model.py` — one model per (source, timeframe), expanding-window
+  purged walk-forward, payout-adjusted metrics + coin-flip control, artifact +
+  metrics JSON. Refuses to train below 400 rows.
+- `signal_backtest.py` — the same model path, OOS only, per (source, timeframe),
+  Wilson CI + p-value + EV + profit factor + breakeven + coin control + verdict.
+
+**Honest results (production `data/candles.db`, 2026-11-08):**
+
+    OTC 60s, 62 pairs, 10,515 rows: hit 50.8%  CI[49.5,52.0]  p=0.232
+      EV -0.061  PF 0.88  breakeven 54.0%  coin control 49.9%  -> BELOW
+    train OTC 60s (10,576 rows): OOS hit 50.2%  CI[48.9,51.4]  p=0.782
+      AUC 0.498  -> BELOW (no edge; exactly the honest outcome)
+
+Controls that prove the pipeline is not broken: on synthetic **momentum** data the
+same trainer/backtest reaches **~67–72% OOS** (AUC ~0.78); on a **random walk** it
+shows no edge. So the code learns when a pattern exists — on this feed there is no
+pattern to learn, which matches every earlier phase.
+
+### Priorities 9–10 — Telegram, paper first
+`signal_telegram.py`: default mode **paper** (journals + prints, never sends).
+`--mode live` sends only if `golive.gate()` reports **LIVE-READY**; otherwise it
+refuses and stays paper. Dedup per (asset, period) with a cooldown; flips pass
+immediately. It never places a trade.
+
+### Priority 11 — storage guard
+`storage_monitor.py`: WARN at 80% (exit 10), ALERT at 90% (exit 20), `--backup`
+writes a compressed **candle-only** archive (ticks excluded), `--prune-ticks N`
+deletes only raw ticks older than N days then VACUUMs — candles untouched, needs
+`--yes`, `--dry-run` previews.
+
+### Priority 12 — tests
+`test_tick_summary.py` (7), `test_ai_signal.py` (6), `test_signal_backtest.py`
+(3), `test_storage_monitor.py` (4), `test_signal_telegram.py` (4). Full suite
+**PASS=38 FAIL=0**. Each new module has a negative control (random walk must not
+look predictable; prune must keep candles; paper mode must not send).
+
+### Commands
+```bash
+python ai_signal_engine.py EURUSD_otc 60                 # one verdict
+python train_signal_model.py --source otc --period 60
+python signal_backtest.py --source otc --all-tf
+python signal_telegram.py --dry-run                      # paper preview
+python signal_telegram.py --mode auto --watch            # live only if gate passes
+python storage_monitor.py --db "$CANDLE_DB" --budget-mb 1024
+python test_tick_summary.py && python test_ai_signal.py
+```
+
+Still open from the (truncated) brief: priorities beyond #11 were not received —
+send the rest and they slot in as the next phase.
+

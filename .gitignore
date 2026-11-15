@@ -7,3 +7,5 @@ logs/
 telegram.json
 payout.json
 processed_data/
+
+models/

@@ -46,6 +46,7 @@ from typing import Optional
 
 from market_qx_candles import CandleBuilder, MarketQX
 from provenance import FEED_ID, classify_source
+from tick_summary import TickSummarizer, SUMMARY_FIELDS, summary_to_row
 
 # Prediction timeframes the collector maintains, in seconds. 30m is included as
 # the brief requires; on this feed the higher timeframes simply take longer to
@@ -71,8 +72,10 @@ class LiveCollector:
         self.verbose = verbose
         # When False, ticks are still received and turned into candles, but the
         # raw `ticks` table is not written. This keeps the DB ~10x smaller, which
-        # is what makes continuous collection fit a small (1 GiB) volume.
+        # is what makes continuous collection fit a small (1 GiB) volume. Tick
+        # order-flow is still preserved as per-candle summaries (tick_summary.py).
         self.store_ticks = store_ticks
+        self.summarizer = TickSummarizer(CANDLE_PERIODS)
 
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -136,6 +139,11 @@ class LiveCollector:
             self.conn.execute("ALTER TABLE candles ADD COLUMN source TEXT")
         if "feed_id" not in ccols:
             self.conn.execute("ALTER TABLE candles ADD COLUMN feed_id TEXT")
+        # Tick-summary columns: order-flow preserved even when raw ticks are not
+        # stored. Additive, so an existing DB is extended in place.
+        for col in SUMMARY_FIELDS:
+            if col not in ccols:
+                self.conn.execute(f"ALTER TABLE candles ADD COLUMN {col} REAL")
         self.conn.commit()
 
     def _count_ticks(self) -> int:
@@ -191,6 +199,11 @@ class LiveCollector:
                         self._buf.popleft()
                     self.stats["ticks_buffer_dropped"] = \
                         self.stats.get("ticks_buffer_dropped", 0) + drop
+        # Tick summaries first: a tick that opens a new bucket finalizes the
+        # previous candle's summary into `pending`, and the builder below fires
+        # `on_closed` for that same bucket and pops it — so the order matters.
+        for p in CANDLE_PERIODS:
+            self.summarizer.add(asset, p, key[0], key[1], d)
         # Feed the candle builders (1m/5m/15m/30m) from the same tick.
         builders = getattr(self, "_builders", None)
         if builders:
@@ -238,17 +251,23 @@ class LiveCollector:
     # ---- candle persistence --------------------------------------------- #
     def _candle_cb(self, asset: str, period: int):
         def handler(candle: list):
+            summary = self.summarizer.pop(asset, period, candle[0])
+            srow = summary_to_row(summary)
+            cols = ("asset,period,time,open,close,high,low,source,feed_id,"
+                    + ",".join(SUMMARY_FIELDS))
+            ph = ",".join(["?"] * (9 + len(SUMMARY_FIELDS)))
             with self._lock:
                 cur = self.conn.execute(
-                    "INSERT OR IGNORE INTO candles"
-                    "(asset,period,time,open,close,high,low,source,feed_id) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    f"INSERT OR IGNORE INTO candles({cols}) VALUES({ph})",
                     (asset, period, candle[0], candle[1], candle[2], candle[3],
-                     candle[4], classify_source(asset), FEED_ID))
+                     candle[4], classify_source(asset), FEED_ID) + srow)
                 self.conn.commit()
                 if cur.rowcount and cur.rowcount > 0:
                     self.stats["candles_saved"] += 1
                     self.stats["per_period"][period] += 1
+                    if summary is not None:
+                        self.stats["candles_with_summary"] = \
+                            self.stats.get("candles_with_summary", 0) + 1
         return handler
 
     # ---- heartbeat / report --------------------------------------------- #
@@ -294,6 +313,7 @@ class LiveCollector:
             "candles_total": candles_now,
             "candles_new": candles_now - self.baseline_candles,
             "candles_saved": self.stats["candles_saved"],
+            "candles_with_summary": self.stats.get("candles_with_summary", 0),
             "candles_dropped_partial": self.stats["candles_dropped_partial"],
             "candles_per_period": {str(k): v for k, v in
                                    sorted(self.stats["per_period"].items())},
@@ -443,6 +463,7 @@ class LiveCollector:
         if getattr(self, "_builders", None):
             dropped = sum(1 for b in self._builders.values() if b.forming is not None)
             self.stats["candles_dropped_partial"] += dropped
+        self.summarizer.drop_forming()
         self._builders = {(a, p): CandleBuilder(p, on_closed=self._candle_cb(a, p))
                           for a in self._assets for p in CANDLE_PERIODS}
 
@@ -451,6 +472,9 @@ class LiveCollector:
             dropped = sum(1 for b in self._builders.values() if b.forming is not None)
             self.stats["candles_dropped_partial"] += dropped
             self._builders = {}
+        # The in-progress tick-summary accumulators are for the same dropped
+        # candles, so discard them too — no half-built summary is ever written.
+        self.summarizer.drop_forming()
 
     def _teardown_session(self):
         try:
