@@ -11,7 +11,7 @@
 #   COLLECTOR_PAIRS=EURUSD_otc,BTCUSD_otc   COLLECTOR_LOG_EVERY=60
 set -u
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")" && pwd)"
 PY="$ROOT/.venv/bin/python"
 [ -x "$PY" ] || PY="python3"
 
