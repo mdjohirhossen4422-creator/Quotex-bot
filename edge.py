@@ -67,6 +67,10 @@ def make_engine(name: str, asset: str):
         from ensemble import EnsembleEngine, EnsembleStrategy
         eng = EnsembleEngine(EnsembleStrategy())
         return eng.evaluate
+    if name == "pa":
+        from pabot import PAEngine, PAStrategy
+        eng = PAEngine(PAStrategy())
+        return lambda cs: eng.evaluate(asset, cs)
     from smart_engine import SmartEngine, SmartStrategy
     eng = SmartEngine(SmartStrategy())
     return eng.evaluate
@@ -136,7 +140,7 @@ def run(store: CandleStore, period: int, engine_name: str,
 def main():
     ap = argparse.ArgumentParser(description="Find pairs that beat a coin flip")
     ap.add_argument("--period", type=int, default=60)
-    ap.add_argument("--engine", choices=["rule", "smart", "ensemble"], default="smart")
+    ap.add_argument("--engine", choices=["rule", "smart", "ensemble", "pa"], default="smart")
     ap.add_argument("--min-signals", type=int, default=20)
     ap.add_argument("--horizon", type=int, default=1,
                     help="expiry in candles (close-to-close)")

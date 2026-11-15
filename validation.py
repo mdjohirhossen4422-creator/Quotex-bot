@@ -290,6 +290,12 @@ def _existing_engine_predictor(engine_name: str):
 
             def call(i):
                 return eng.evaluate(candles[:i + 1])
+        elif engine_name == "pa":
+            from pabot import PAEngine, PAStrategy
+            eng = PAEngine(PAStrategy())
+
+            def call(i):
+                return eng.evaluate(asset, candles[:i + 1])
         else:
             raise ValueError(f"unknown engine {engine_name!r}")
 
@@ -392,7 +398,7 @@ def main():
     ap = argparse.ArgumentParser(description="Purged walk-forward validation harness")
     ap.add_argument("--db", default="data/candles.db")
     ap.add_argument("--period", type=int, default=60)
-    ap.add_argument("--engine", choices=["rule", "smart", "ensemble", "all"], default="rule")
+    ap.add_argument("--engine", choices=["rule", "smart", "ensemble", "pa", "all"], default="rule")
     ap.add_argument("--source", choices=[SOURCE_OTC, SOURCE_REAL, SOURCE_SYNTHETIC],
                     default=SOURCE_OTC)
     ap.add_argument("--payout", type=float, default=DEFAULT_PAYOUT)

@@ -95,6 +95,41 @@ def analyze_ensemble(asset: str, period: int, candles: list[list],
     return res
 
 
+def analyze_pa(asset: str, period: int, candles: list[list],
+               strategy=None) -> Analysis:
+    """Indicator + price action + SMC confluence (no training; `pabot.PAEngine`).
+
+    Same `Analysis` shape as the other adapters so the dashboard, scanner and
+    alerts can all render it. `values` carries the per-family block votes.
+    """
+    from pabot import PAEngine, PAStrategy
+
+    eng = PAEngine(strategy or PAStrategy())
+    res = Analysis(asset=asset, period=period, candles=len(candles),
+                   enough=len(candles) >= eng.s.min_candles(), engine="pa")
+    if not res.enough:
+        need = eng.s.min_candles()
+        res.note = (f"need {need} candles, have {len(candles)} — "
+                    f"let it stream for {(need - len(candles)) * period}s more")
+        return res
+
+    sig = eng.evaluate(asset, candles)
+    if sig is None:
+        res.note = ("no setup: fewer than "
+                    f"{eng.s.min_blocks} families (indicator/price-action/SMC) agree")
+        return res
+    res.action = sig.action
+    res.regime = sig.regime
+    res.confidence = sig.confidence
+    res.score = sig.score
+    res.reasons = sig.reasons
+    res.bull = sum(1 for v in sig.blocks.values() if v == "CALL")
+    res.bear = sum(1 for v in sig.blocks.values() if v == "PUT")
+    res.values = {"price": sig.price, "last_candle_time": sig.time,
+                  "blocks": sig.blocks}
+    return res
+
+
 def analyze(asset: str, period: int, candles: list[list],
             strategy: Optional[Strategy] = None, threshold: int = 4) -> Analysis:
     s = strategy or Strategy()

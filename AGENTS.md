@@ -117,6 +117,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `invert.py` | is the signal anti-predictive? policy chosen on train, frozen, applied to test |
 | `meta.py` | meta-labeling gate: learn P(win) for each engine signal, keep only the confident ones (pooled walk-forward + controls) |
 | `combine.py` | combine EVERY source (base+v2+patterns+order flow+engines) into one model, honestly scored; `--zoo`/`--search` show the overfitting trap |
+| `pabot.py` | rule-based **indicator + price action + SMC** bot, NO training (instant); `--watch`, and engine `pa` in scan/dashboard/alerts |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
 | `run_dashboard.sh` | starts the dashboard on the public work host |
@@ -155,6 +156,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_features_v2.py` | feature shape/uniqueness, label correctness, causality, random-walk control |
 | `test_meta.py` | meta-labeling gate: causal signal collection, pooled + per-pair controls, batch/single agreement |
 | `test_combine.py` | combine.py: label correctness, causality, coin-flip control, no-edge and learnable-edge controls |
+| `test_pabot.py` | pabot.py: offline reads, determinism, vote logic, causality, adapter shape, training-free check |
 
 ## P0/P1 — provenance, payout, and the validation harness (2026-11-07)
 
@@ -882,3 +884,44 @@ flow, and the engines themselves — does not move the hit-rate past the payout
 breakeven. That is the measured truth of this feed, and no amount of feature
 stacking or validation-tuning changes it. The honest levers left are more data on
 long timeframes and non-OTC pairs in real market hours.
+
+## Indicator + price action + SMC bot, no training (`pabot.py`, 2026-11-08)
+
+Requested because every trained model takes time to fit. `pabot.py` is a
+**rule-based** bot that needs **no training at all** — it reads the last closed
+candle instantly and scores three independent families, firing only when they
+agree:
+
+| family | what it reads | source |
+|---|---|---|
+| indicator | EMA stack + fresh EMA/MACD cross, RSI, Stochastic, Bollinger | `indicators.py` |
+| price action | S/R rejection vs break, chart patterns (H&S, double, triangle, flag) | `patterns.py` |
+| SMC | structure, liquidity sweep, order block, FVG, premium/discount | `smc.py` |
+
+A signal needs `min_blocks` (default 2) of the 3 families pointing the same way;
+ADX only labels the regime (trend / range / transition), it does not veto. The
+verdict is explainable — every reason is tagged with the family that produced it.
+
+    python pabot.py EURUSD_otc 60            # one-shot, instant
+    python pabot.py EURUSD_otc 60 --watch    # re-read every 5s
+    python scan.py --engine pa               # scan every pair
+    ./run_dashboard.sh                       # Engine -> "Price Action + SMC (no training)"
+    ./run_alerts.sh --engine pa              # Telegram alerts from this bot
+
+`analysis.analyze_pa` is the adapter (same `Analysis` shape), so `pa` is a
+first-class engine in `scan.py`, `dashboard.py`, `alerts.py`, `edge.py` and
+`validation.py` — switch with `--engine pa` or the dashboard dropdown.
+
+**Honest measurement (do not skip).** This is the same confluence idea as §7 and
+§8, so it was judged the same way — purged walk-forward, OTC pairs only, vs the
+54.05% breakeven:
+
+    60s  1234 OOS trades  hit 52.43%  CI[49.64,55.21]  EV -0.030  verdict INDISTINGUISHABLE
+    15s  5107 OOS trades  hit 50.23%  CI[48.85,51.60]  verdict BELOW
+
+Instant and training-free does **not** mean it has an edge: it lands at 50–52%,
+the CI straddles the breakeven, and the payout-adjusted EV is negative. It is a
+fast, explainable *presentation* of three classic readings — the same alert, not
+a proven trade. `test_pabot.py` proves the code is correct (offline reads,
+determinism, causality, adapter shape, and a source scan that forbids any
+ML/training import), so the flat live result is the data, not the bot.

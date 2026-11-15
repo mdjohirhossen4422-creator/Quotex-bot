@@ -27,7 +27,7 @@ import json
 import os
 import time
 
-from analysis import analyze, analyze_smart, analyze_ensemble
+from analysis import analyze, analyze_smart, analyze_ensemble, analyze_pa
 from candle_store import CandleStore, PERIODS
 from payout import DEFAULT_PAYOUT
 
@@ -107,7 +107,10 @@ def scan_all(store: CandleStore, periods: list[int], engine: str = "rule",
     can only remove signals, never change a direction. Rows carry the gate's
     `p_win` so the effect is visible.
     """
-    fn = analyze_smart if engine == "smart" else (analyze_ensemble if engine == "ensemble" else analyze)
+    fn = (analyze_smart if engine == "smart"
+          else analyze_ensemble if engine == "ensemble"
+          else analyze_pa if engine == "pa"
+          else analyze)
     pairs = store.series(min_candles=min_candles, periods=periods)
     now = time.time()
     fired, waiting, dead = [], 0, 0
@@ -225,7 +228,7 @@ def _print_report(rep: dict, top: int):
     for r in rep["signals"][:top]:
         arrow = {"CALL": "▲ CALL", "PUT": "▼ PUT"}.get(r["action"], "· NEUTRAL")
         tf = f"{r['label']:>4}" if multi else ""
-        if rep["engine"] == "smart":
+        if rep["engine"] in ("smart", "pa"):
             detail = f"{r['regime'] or '-':5} conf {r['confidence']:.2f}"
         else:
             detail = f"score {r['score']:>2}  (bull {r['bull']}/bear {r['bear']})"
@@ -245,7 +248,8 @@ def main():
     ap.add_argument("--db", default="data/candles.db")
     ap.add_argument("--top", type=int, default=12)
     ap.add_argument("--all", action="store_true", help="also list NEUTRAL rows")
-    ap.add_argument("--engine", choices=["rule", "smart", "ensemble"], default="rule")
+    ap.add_argument("--engine", choices=["rule", "smart", "ensemble", "pa"],
+                    default="rule")
     ap.add_argument("--min-candles", type=int, default=0,
                     help="only scan series with at least this many candles")
     ap.add_argument("--expiry", type=int, default=1, metavar="N",

@@ -190,7 +190,7 @@ def scan_once(store: CandleStore, periods: list[int], min_score: int,
     for row in rep["signals"]:
         if row["action"] == "NEUTRAL":
             continue
-        if engine == "smart":
+        if engine in ("smart", "pa"):
             if row["confidence"] < min_conf:
                 continue
         elif row["score"] < min_score:
@@ -203,7 +203,7 @@ def scan_once(store: CandleStore, periods: list[int], min_score: int,
                 print(f"[dry-run]\n{msg}\n")
             else:
                 send(token, chat, msg)
-                strength = (f"conf {row['confidence']:.2f}" if engine == "smart"
+                strength = (f"conf {row['confidence']:.2f}" if engine in ("smart", "pa")
                             else f"score {row['score']}")
                 print(f"sent: {row['action']} {row['asset']} "
                       f"{row['period']}s {strength}")
@@ -224,8 +224,8 @@ def main():
                     help="smart engine: only alert at/above this confidence")
     ap.add_argument("--expiry", type=int, default=1, metavar="N",
                     help="expiry in candles after entry, shown in the alert")
-    ap.add_argument("--engine", choices=["rule", "smart"], default="rule",
-                    help="rule = indicator votes; smart = regime + volatility")
+    ap.add_argument("--engine", choices=["rule", "smart", "pa"], default="rule",
+                    help="rule=indicator votes; smart=regime+vol; pa=price action+SMC")
     ap.add_argument("--gate", action="store_true",
                     help="meta-labeling filter: drop signals the model expects to lose")
     ap.add_argument("--gate-threshold", type=float, default=0.55,
@@ -267,7 +267,7 @@ def main():
     state = load_state()
     label = "all" if len(periods) == len(PERIODS) else \
         ",".join(PERIOD_LABEL.get(p, str(p)) for p in periods)
-    strength = (f"min conf {args.min_conf}" if args.engine == "smart"
+    strength = (f"min conf {args.min_conf}" if args.engine in ("smart", "pa")
                 else f"min score {args.min_score}")
     print(f"watching {label} ({len(periods)} timeframes) | engine {args.engine} | "
           f"{strength} | cooldown {int(args.cooldown)}s | every {int(args.interval)}s")

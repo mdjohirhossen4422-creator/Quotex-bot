@@ -24,7 +24,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from analysis import analyze, analyze_smart, analyze_ensemble
+from analysis import analyze, analyze_smart, analyze_ensemble, analyze_pa
 from candle_store import CandleStore, MultiFeed, PERIODS, TIMEFRAMES, asset_catalog
 from journal import Journal, settle_open, summary as journal_summary
 from payout import DEFAULT_PAYOUT
@@ -109,6 +109,7 @@ PAGE = """<!doctype html>
           <option value="rule">Rule (indicator votes)</option>
           <option value="smart">Smart (regime + volatility)</option>
           <option value="ensemble">Ensemble (SMC + trend + momentum)</option>
+          <option value="pa">Price Action + SMC (no training)</option>
         </select>
       </div>
       <button id="go">Analyze</button>
@@ -221,7 +222,7 @@ async function scanAll(){
     const el=document.getElementById('scanList');
     if(!j.signals.length){el.innerHTML='<div class="mut" style="padding:10px 0">no signal right now — most candles are noise</div>';return;}
     el.innerHTML=j.signals.map(s=>{
-      const strength=(j.engine==='smart')
+      const strength=(j.engine==='smart'||j.engine==='pa')
         ? 'conf '+s.confidence.toFixed(2)+(s.regime?(' · '+s.regime):'')
         : 'score '+s.score+' · bull '+s.bull+' / bear '+s.bear;
       const why=(s.reasons||[]).slice(0,2).join(' · ');
@@ -256,7 +257,7 @@ function renderAnalysis(A){
   v.className='verdict '+(A.action==='CALL'?'call':A.action==='PUT'?'put':'neutral');
   document.getElementById('vbig').textContent=A.action==='NEUTRAL'?'NO TRADE':A.action;
   let sub;
-  if(A.engine==='smart'){
+  if(A.engine==='smart'||A.engine==='pa'){
     sub=A.action!=='NEUTRAL'
       ? (A.asset+' · '+A.period+'s · '+A.regime+' · confidence '+A.confidence.toFixed(2))
       : (A.enough? (A.asset+' · '+A.period+'s · '+A.note) : A.note);
@@ -605,6 +606,7 @@ class Handler(BaseHTTPRequestHandler):
                 expiry = 1
             res = (analyze_smart(asset, period, candles) if engine == "smart"
                    else analyze_ensemble(asset, period, candles) if engine == "ensemble"
+                   else analyze_pa(asset, period, candles) if engine == "pa"
                    else analyze(asset, period, candles))
             out = res.__dict__
             if res.enough and candles:
