@@ -1169,3 +1169,22 @@ The collector writes `data/collector_state.json` (heartbeat, rewritten every 5s)
 * No model, signal, Telegram or trading path is started here. This phase only
   collects data; `pipeline.run` is what turns it into datasets, and it must be
   re-run after the collector has built up history.
+
+## Phase 2.6 — Botkeep.cloud free-plan compatibility audit (2026-11-15)
+
+Audit + preparation only; nothing deployed. Full detail in `BOTKEEP_AUDIT.md`.
+Botkeep Free = 1 slot, 512 MB RAM, 0.5 vCore, **1 GB storage**, 24/7, no SLA.
+
+- **Fits:** RAM 47–50 MB RSS (flat), CPU ~3.3 % of one core, feed reachable
+  (`ws2.market-qx.info:443`, 92 instruments), restart + SIGKILL crash recovery
+  keep every row with 0 duplicates. Collector deps are stdlib + `websocket-client`
+  only (`requirements-collector.txt`).
+- **Hard blocker — storage:** raw ticks grow ~1.3 GB/day vs a 1 GB disk (<1 day).
+  Fix: **`--no-ticks`** mode (`COLLECTOR_STORE_TICKS=0`) writes candles only,
+  ~63 MB/day (~16 days on 1 GB). Ticks are ~85 % of the bytes.
+- **NEEDS TEST on the instance:** filesystem persistence across redeploy, and a
+  24 h uptime run. Both require deploying; not done.
+- Run `python botkeep_preflight.py` on the box first (PASS/FAIL readiness).
+- Proposed Botkeep start command (pending approval):
+  `python live_collector.py --no-ticks`, with `CANDLE_DB` / `COLLECTOR_STATE`
+  pointing at the persistent path. No secret is needed to collect.
