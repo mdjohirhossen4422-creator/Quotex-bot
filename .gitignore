@@ -9,3 +9,5 @@ payout.json
 processed_data/
 
 models/
+
+dist/

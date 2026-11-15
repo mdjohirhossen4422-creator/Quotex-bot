@@ -34,8 +34,9 @@ FEED_PORT = 443
 
 
 def _ok(name, detail, status="PASS"):
+    """Print one check. Returns True unless the status is FAIL (WARN is fine)."""
     print(f"[{status}] {name}: {detail}")
-    return status == "PASS"
+    return status != "FAIL"
 
 
 def check_python():

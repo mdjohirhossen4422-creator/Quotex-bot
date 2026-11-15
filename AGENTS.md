@@ -1352,3 +1352,44 @@ results (momentum ~67-72%) are pipeline checks, **not** real-market accuracy and
 are never reported as such.
 
 
+
+## Botkeep collector deployment ZIP (2026-11-08)
+
+`package_botkeep.py` builds a self-contained, secret-free archive for deploying
+the **collector only** to Botkeep.cloud. Nothing is uploaded by the repo — the
+ZIP is uploaded by hand in the Botkeep panel.
+
+    python package_botkeep.py --check      # -> dist/botkeep-collector-<date>.zip
+    python test_package_botkeep.py         # 5 checks
+
+What goes in (flat at the archive root, so Botkeep finds `requirements.txt`):
+`live_collector.py`, `market_qx_candles.py`, `candle_store.py`, `provenance.py`,
+`tick_summary.py`, `botkeep_preflight.py`, `storage_monitor.py`,
+`requirements.txt` (`websocket-client>=1.6,<2.0`), `requirements-collector.txt`,
+`start.sh`, and the two READMEs. That is the whole import graph of the collector
+— it needs **no** numpy/scikit-learn/pyarrow.
+
+What is refused: `.env`, `telegram.json`, `payout.json`, `.git`, `__pycache__`,
+`.venv`, every `*.db` (including `data/candles.db`), and any file whose text
+matches the secret regex (assigned `*_token` / `api_key` / `password`, a
+`\d{8,10}:[A-Za-z0-9_-]{30,}` Telegram token, or a private key block). The scan
+runs before a byte is written, so a leak aborts the build.
+
+Start command on Botkeep: `python live_collector.py --no-ticks` (or `bash
+start.sh` for a crash-restart loop). `--no-ticks` is required on the 1 GB free
+disk: raw ticks ~1.3 GB/day, candle-only ~63 MB/day. Full manual steps are in
+`deploy/botkeep/DEPLOY_ZIP_README.md` (shipped as `README.md`).
+
+`botkeep_preflight.py` fix: a WARN (e.g. "db not present yet — fresh start") is
+no longer counted as a failure; exit is 1 only on a real FAIL. The docs always
+said this; the code now matches.
+
+**No automated-deploy API.** Botkeep documents deployment only through the
+authenticated panel (ZIP wizard + GitHub App; `botkeep.cloud/docs/zip`,
+`/docs/github`). The panel uses a private, session-guarded `/api/v1/...` with no
+public app/deploy route and no issued API tokens; `api.botkeep.cloud` returns
+403 and there is no OpenAPI page. Deployment stays manual.
+
+AI Telegram remains **paper only**: `signal_telegram.py` defaults to
+`--mode paper`, and `--mode live` refuses unless `golive.gate()` reports
+LIVE-READY (currently NOT READY). The ZIP contains no Telegram code at all.
