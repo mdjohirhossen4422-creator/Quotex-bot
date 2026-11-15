@@ -30,6 +30,7 @@ import os
 import sqlite3
 import time
 from collections import defaultdict
+from typing import Optional
 
 from candle_store import CandleStore, PERIODS
 from scan import scan_all
@@ -58,8 +59,17 @@ class Journal:
                    score REAL, confidence REAL, regime TEXT,
                    result TEXT DEFAULT 'open',      -- open|win|loss|flat
                    settle_price REAL, settled_at INTEGER,
+                   model_version TEXT,              -- which model produced it
                    UNIQUE(asset, period, entry_at, engine, action))""")
         self._db.commit()
+        self._migrate()
+
+    def _migrate(self):
+        """Additive migration: add model_version to an older journal."""
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(signals)")}
+        if "model_version" not in cols:
+            self._db.execute("ALTER TABLE signals ADD COLUMN model_version TEXT")
+            self._db.commit()
 
     def add(self, row: dict, engine: str, now: int) -> bool:
         """Insert a signal; returns False if it was already logged."""
@@ -68,12 +78,13 @@ class Journal:
                 """INSERT OR IGNORE INTO signals(
                        logged_at, asset, period, engine, action,
                        entry_at, entry_price, expiry_at, expiry_candles,
-                       score, confidence, regime)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       score, confidence, regime, model_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (now, row["asset"], row["period"], engine, row["action"],
                  row["entry_at"], row.get("price", 0.0), row["expiry_at"],
                  row["expiry_candles"], row.get("score", 0.0),
-                 row.get("confidence", 0.0), row.get("regime", "")))
+                 row.get("confidence", 0.0), row.get("regime", ""),
+                 row.get("model_version", "")))
             self._db.commit()
             return cur.rowcount > 0
 
@@ -83,16 +94,24 @@ class Journal:
                 "SELECT id,asset,period,action,entry_at,entry_price,expiry_at "
                 "FROM signals WHERE result='open'").fetchall()
 
-    def settle(self, sid: int, result: str, price: float, now: int):
+    def settle(self, sid: int, result: str, price: float, now: int,
+               entry_price: Optional[float] = None):
         with self._lock:
-            self._db.execute(
-                "UPDATE signals SET result=?, settle_price=?, settled_at=? WHERE id=?",
-                (result, price, now, sid))
+            if entry_price is not None:
+                self._db.execute(
+                    "UPDATE signals SET result=?, settle_price=?, settled_at=?, "
+                    "entry_price=? WHERE id=?",
+                    (result, price, now, entry_price, sid))
+            else:
+                self._db.execute(
+                    "UPDATE signals SET result=?, settle_price=?, settled_at=? WHERE id=?",
+                    (result, price, now, sid))
             self._db.commit()
 
     def rows(self, asset: str = "", engine: str = "") -> list[tuple]:
         sql = ("SELECT asset,period,engine,action,result,entry_at,expiry_at,"
-               "entry_price,settle_price,score,confidence FROM signals")
+               "entry_price,settle_price,score,confidence,model_version "
+               "FROM signals")
         where, params = [], []
         if asset:
             where.append("asset=?"); params.append(asset)
@@ -125,7 +144,7 @@ def settle_open(j: Journal, store: CandleStore, now: int) -> int:
             result = "win"
         else:
             result = "loss"
-        j.settle(sid, result, sp, now)
+        j.settle(sid, result, sp, now, entry_price=ep)
         settled += 1
     return settled
 

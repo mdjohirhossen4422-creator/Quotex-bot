@@ -117,9 +117,49 @@ def test_paper_run_journals_when_not_dry():
     print("PASS test_paper_run_journals_when_not_dry")
 
 
+def test_period_gate_disables_long_timeframes():
+    d = tempfile.mkdtemp()
+    db = os.path.join(d, "c.db")
+    _seed(db, "EURUSD_otc", _make(600, 0.7, seed=23))   # 60s only
+    from signal_data import SignalData
+    sd = SignalData(db)
+    r60 = sd.period_readiness("otc", 60, 120)
+    r300 = sd.period_readiness("otc", 300, 120)
+    sd.close()
+    assert r60["ready"] and r60["usable"] == 1, r60
+    assert not r300["ready"] and r300["usable"] == 0, r300
+
+    # and the scan must skip the disabled period entirely
+    from ai_signal_engine import AISignalEngine
+    sd = SignalData(db)
+    eng = AISignalEngine(db, "/nonexistent", 0.0, 0)
+    sigs = st.scan(eng, sd, [60, 300], "otc", 0.0, 120)
+    sd.close()
+    assert all(s["period"] == 60 for s in sigs), sigs
+    print("PASS test_period_gate_disables_long_timeframes")
+
+
+def test_journal_records_model_version():
+    d = tempfile.mkdtemp()
+    db = os.path.join(d, "c.db")
+    _seed(db, "EURUSD_otc", _make(600, 0.7, seed=24))
+    state = os.path.join(d, "state.json")
+    journal = os.path.join(d, "j.db")
+    args = _args(db, state, journal, dry=False)
+    st.run_once(args, send_messages=False)
+    con = sqlite3.connect(journal)
+    rows = con.execute("SELECT model_version FROM signals").fetchall()
+    con.close()
+    # every logged signal carries a non-empty model version (req 6)
+    assert all(r[0] for r in rows), rows
+    print("PASS test_journal_records_model_version")
+
+
 if __name__ == "__main__":
     test_should_send_dedup_and_flip()
     test_formatter_says_paper_not_trade()
     test_paper_run_never_sends_and_dry_run_no_journal()
     test_paper_run_journals_when_not_dry()
+    test_period_gate_disables_long_timeframes()
+    test_journal_records_model_version()
     print("\nall signal-telegram tests passed")

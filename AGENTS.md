@@ -1275,22 +1275,80 @@ deletes only raw ticks older than N days then VACUUMs — candles untouched, nee
 `--yes`, `--dry-run` previews.
 
 ### Priority 12 — tests
-`test_tick_summary.py` (7), `test_ai_signal.py` (6), `test_signal_backtest.py`
-(3), `test_storage_monitor.py` (4), `test_signal_telegram.py` (4). Full suite
-**PASS=38 FAIL=0**. Each new module has a negative control (random walk must not
-look predictable; prune must keep candles; paper mode must not send).
+`test_tick_summary.py` (7), `test_ai_signal.py` (7), `test_signal_backtest.py`
+(3), `test_storage_monitor.py` (4), `test_signal_telegram.py` (6),
+`test_signal_report.py` (5). Full suite **39/39 test files pass**. Each new module
+has a negative control (random walk must not look predictable; prune must keep
+candles; paper mode must not send).
 
-### Commands
+## Phase 2.7 — paper signal system + deploy prep (2026-11-08)
+
+Operator-approved build. The collector keeps running; the AI system is wired for
+paper operation. **Nothing trades, nothing is deployed by the repo** (the
+Botkeep dashboard step is the operator's).
+
+### Deploy artifacts (req 1,2,10)
+- `deploy/botkeep/README.md` — start command, env, minimal file list, preflight,
+  the storage guard, and the two checks that need the instance.
+- `deploy/botkeep/start.sh` — self-contained supervisor: `--no-ticks`,
+  `COLLECTOR_STORE_TICKS=0`, crash-restart with backoff.
+- `verify_restart.py` — runs the real collector twice against an isolated temp DB
+  and asserts run-1 candles survive, **0 duplicates**, and the file persists.
+  Note: market-qx allows **one live session per source IP**, so stop the
+  production collector before running it locally.
+
+### Journal records the full lifecycle (req 6)
+`journal.py` gained a `model_version` column (additive `ALTER TABLE`; old DBs
+migrate in place) and now backfills the resolved `entry_price` at settle time.
+Every AI signal stores: entry time + price, expiry time, the model version that
+produced it, and (after the expiry candle closes) the settle price and outcome.
+
+### Daily performance report (req 7)
+`signal_report.py` reads the journal and prints, per UTC day (bucketed by the
+signal's **entry** day):
+
+    day  settled  win loss flat  hit%   95% CI          EV   verdict
+
+- hit-rate is on **decisive** rows only (flat ties excluded) with a Wilson CI;
+- EV is payout-adjusted and the report states where the payout came from —
+  `[assumed — no payout.json]` vs `[from payout.json]`. The feed never transmits
+  payout, so "assumed" is the honest default;
+- a day with <30 decisive trades is labelled **insufficient** — no verdict;
+- `--write DIR` dumps per-day JSON + a rolling summary; `--json` for machines.
+
+On the production journal (2 days, 43,514 decisive): hit 49.9%, CI [49.5, 50.4],
+EV −0.076, verdict **below** — the same honest no-edge result as the backtests.
+
+### Timeframe gate (req 8)
+`signal_data.period_readiness()` reports whether a (source, period) has enough
+candles; `signal_telegram.py` **disables** a timeframe that is not ready and says
+so. 5m/15m/30m are DISABLED until the collector has produced ≥120 candles per
+pair — no signal is emitted from too few candles. Check with
+`python signal_telegram.py --readiness --periods 60,300,900,1800`.
+
+### Storage watch (req 10)
+`storage_monitor.py --watch` loops: OK/WARN(≥80%)/ALERT(≥90%); on WARN it backs
+up candles, on ALERT (with `--yes --auto-prune-days N`) it also prunes raw ticks
+older than N days. Candles are never pruned automatically.
+
+### Paper Telegram (req 5)
+Default `--mode paper`: signals are computed, journaled and printed — **never
+sent**. `--mode live` sends only if the go-live gate is LIVE-READY (it is not);
+otherwise it refuses and stays paper. Req 9 (never trade live) is enforced by the
+gate plus the absence of any order-placement code.
+
 ```bash
-python ai_signal_engine.py EURUSD_otc 60                 # one verdict
-python train_signal_model.py --source otc --period 60
-python signal_backtest.py --source otc --all-tf
-python signal_telegram.py --dry-run                      # paper preview
-python signal_telegram.py --mode auto --watch            # live only if gate passes
-python storage_monitor.py --db "$CANDLE_DB" --budget-mb 1024
-python test_tick_summary.py && python test_ai_signal.py
+python signal_report.py --days 7            # daily hit/CI/EV table
+python signal_telegram.py --readiness       # which timeframes are enabled
+python signal_telegram.py --mode paper --watch   # paper loop (journals + prints)
+python storage_monitor.py --watch --interval 300 --auto-backup
+python verify_restart.py --minutes 2.5 --pairs EURUSD_otc
 ```
 
-Still open from the (truncated) brief: priorities beyond #11 were not received —
-send the rest and they slot in as the next phase.
+### The one number that matters (req: honesty)
+No accuracy improvement is claimed. The paper journal's forward hit-rate, the
+backtests, and the model AUC all sit at ~50% on this feed. Synthetic-control
+results (momentum ~67-72%) are pipeline checks, **not** real-market accuracy and
+are never reported as such.
+
 

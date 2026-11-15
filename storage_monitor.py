@@ -115,28 +115,14 @@ def prune_ticks(db: str, days: int, dry_run: bool) -> dict:
             "after_bytes": _bytes(db), "dry_run": False}
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Storage guard for the collector")
-    ap.add_argument("--db", default=os.environ.get("CANDLE_DB", "data/candles.db"))
-    ap.add_argument("--budget-mb", type=int, default=DEFAULT_BUDGET_MB)
-    ap.add_argument("--backup", action="store_true")
-    ap.add_argument("--backup-dir", default=DEFAULT_BACKUP_DIR)
-    ap.add_argument("--prune-ticks", type=int, default=0,
-                    help="delete raw ticks older than N days (needs --yes)")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--yes", action="store_true")
-    ap.add_argument("--json", action="store_true")
-    args = ap.parse_args()
-
-    if not os.path.exists(args.db):
-        print(f"db not found: {args.db}")
-        sys.exit(2)
-
+def _cycle(args) -> dict:
+    """One storage check + optional backup/prune. Returns the report dict."""
     report = evaluate(args.db, args.budget_mb)
     if not args.json:
         r = report["rows"]
-        print(f"storage: {report['total_bytes']/1e6:.1f} MB of "
-              f"{args.budget_mb} MB ({report['pct']}%) -> {report['status']}")
+        print(f"[{time.strftime('%H:%M:%S')}] storage: "
+              f"{report['total_bytes']/1e6:.1f} MB of {args.budget_mb} MB "
+              f"({report['pct']}%) -> {report['status']}")
         print(f"  db={report['db_bytes']/1e6:.1f} MB  wal={report['wal_bytes']/1e6:.1f} MB"
               f"  rows: ticks={r.get('ticks')} candles={r.get('candles')}")
         if report["status"] == "WARN":
@@ -161,10 +147,77 @@ def main():
             print(f"  {verb} {res['would_delete']:,} ticks older than "
                   f"{args.prune_ticks} days "
                   f"({res['before_bytes']/1e6:.0f} -> {res['after_bytes']/1e6:.0f} MB)")
+    return report
 
+
+def watch(args):
+    """Loop forever, warning before capacity runs out (req 10).
+
+    On WARN: back up candles (if --auto-backup). On ALERT: back up and, if
+    --auto-prune-days is set AND --yes is given, prune ticks older than that.
+    Candles are never pruned automatically.
+    """
+    print(f"storage watch — db={args.db} budget={args.budget_mb}MB "
+          f"interval={args.interval}s  (ctrl-c to stop)")
+    while True:
+        report = evaluate(args.db, args.budget_mb)
+        status = report["status"]
+        if status == "WARN":
+            print(f"[{time.strftime('%H:%M:%S')}] WARN {report['pct']}% — "
+                  "backing up candles")
+            if args.auto_backup:
+                print("  backup ->", backup_candles(args.db, args.backup_dir))
+        elif status == "ALERT":
+            print(f"[{time.strftime('%H:%M:%S')}] ALERT {report['pct']}% — "
+                  "archiving and pruning")
+            if args.auto_backup:
+                print("  backup ->", backup_candles(args.db, args.backup_dir))
+            if args.auto_prune_days and args.yes:
+                res = prune_ticks(args.db, args.auto_prune_days, False)
+                print(f"  pruned {res['deleted']:,} ticks "
+                      f"({res['before_bytes']/1e6:.0f} -> "
+                      f"{res['after_bytes']/1e6:.0f} MB)")
+            elif args.auto_prune_days:
+                print("  (auto-prune needs --yes; skipping)")
+        else:
+            print(f"[{time.strftime('%H:%M:%S')}] OK {report['pct']}% "
+                  f"({report['total_bytes']/1e6:.0f} MB)")
+        time.sleep(args.interval)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Storage guard for the collector")
+    ap.add_argument("--db", default=os.environ.get("CANDLE_DB", "data/candles.db"))
+    ap.add_argument("--budget-mb", type=int, default=DEFAULT_BUDGET_MB)
+    ap.add_argument("--backup", action="store_true")
+    ap.add_argument("--backup-dir", default=DEFAULT_BACKUP_DIR)
+    ap.add_argument("--prune-ticks", type=int, default=0,
+                    help="delete raw ticks older than N days (needs --yes)")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--watch", action="store_true", help="loop, warning before full")
+    ap.add_argument("--interval", type=float, default=300.0)
+    ap.add_argument("--auto-backup", action="store_true",
+                    help="with --watch: back up candles on WARN/ALERT")
+    ap.add_argument("--auto-prune-days", type=int, default=0,
+                    help="with --watch --yes: prune ticks older than N days on ALERT")
+    args = ap.parse_args()
+
+    if not os.path.exists(args.db):
+        print(f"db not found: {args.db}")
+        sys.exit(2)
+
+    if args.watch:
+        try:
+            watch(args)
+        except KeyboardInterrupt:
+            print("\nstopped.")
+        return
+
+    report = _cycle(args)
     if args.json:
         print(json.dumps(report, indent=2, default=str))
-
     sys.exit(_exit_code(report["status"]))
 
 

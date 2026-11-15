@@ -16,6 +16,12 @@ See `../../BOTKEEP_AUDIT.md` for the full compatibility audit and measurements.
 python live_collector.py --no-ticks
 ```
 
+or use the bundled supervisor (crash-restart loop + the env below):
+
+```
+bash deploy/botkeep/start.sh
+```
+
 `--no-ticks` is required on the free plan: raw ticks grow ~1.3 GB/day and would
 fill a 1 GB disk in under a day. Candle-only mode grows ~63 MB/day (~16 days) and
 **still preserves order-flow** as per-candle tick summaries (`tick_summary.py`),
@@ -58,12 +64,27 @@ Run the storage guard on a schedule (or from the panel's task runner):
 
 ```
 python storage_monitor.py --db "$CANDLE_DB" --budget-mb 1024     # WARN 80%, ALERT 90%
+python storage_monitor.py --db "$CANDLE_DB" --budget-mb 1024 --watch --interval 300 \
+    --auto-backup --auto-prune-days 7 --yes                      # warn before it fills
 python storage_monitor.py --backup                               # compressed candle archive
 python storage_monitor.py --prune-ticks 7 --dry-run              # preview
 python storage_monitor.py --prune-ticks 7 --yes                  # reclaim (only if ticks were stored)
 ```
 
 Exit codes: `0` OK, `10` WARN (≥80%), `20` ALERT (≥90%), so a monitor can react.
+`--watch` loops, backs up candles on WARN/ALERT, and (with `--yes
+--auto-prune-days N`) prunes raw ticks older than N days on ALERT. Candles are
+never pruned automatically.
+
+## Verify persistence locally before you deploy (requirement 2)
+
+```
+python verify_restart.py --minutes 1.3 --pairs EURUSD_otc
+```
+
+Runs the real collector twice against an isolated temp DB and asserts run-1
+candles survive the restart, no duplicates appear, and the file persists. Needs
+>60 s per run (a 1 m candle must close).
 
 ## Two checks that must be done ON the instance (not provable locally)
 

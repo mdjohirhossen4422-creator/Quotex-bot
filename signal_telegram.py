@@ -94,9 +94,16 @@ def format_signal(res, plan: dict) -> str:
 
 
 def scan(engine: AISignalEngine, sd: SignalData, periods: list[int],
-         source: str, min_conf: float, min_candles: int) -> list[dict]:
+         source: str, min_conf: float, min_candles: int,
+         verbose: bool = False) -> list[dict]:
     out = []
     for period in periods:
+        ready = sd.period_readiness(source, period, min_candles)
+        if not ready["ready"]:
+            if verbose:
+                print(f"  [{period}s] DISABLED — needs {min_candles} candles "
+                      f"per pair, best has fewer (req 8: wait for data)")
+            continue
         for asset in sd.assets(source, period, min_candles):
             res = engine.evaluate(asset, period)
             if res.action not in ("CALL", "PUT"):
@@ -104,8 +111,10 @@ def scan(engine: AISignalEngine, sd: SignalData, periods: list[int],
             if res.confidence < min_conf:
                 continue
             plan = entry_plan(period, time.time())
+            mv = res.values.get("model") or "heuristic"
             out.append({"asset": asset, "period": period, "action": res.action,
-                        "confidence": res.confidence, "res": res, "plan": plan})
+                        "confidence": res.confidence, "res": res, "plan": plan,
+                        "model_version": mv})
     return out
 
 
@@ -114,7 +123,7 @@ def run_once(args, *, send_messages: bool) -> dict:
     engine = AISignalEngine(args.db, args.model_dir, args.min_confidence,
                             args.mtf_period)
     signals = scan(engine, sd, args.periods, args.source, args.min_confidence,
-                   args.min_candles)
+                   args.min_candles, verbose=getattr(args, "verbose", False))
     sd.close()
 
     now = time.time()
@@ -133,7 +142,8 @@ def run_once(args, *, send_messages: bool) -> dict:
                          "action": s["action"], "entry_at": int(s["plan"]["entry_at"]),
                          "price": 0.0, "expiry_at": int(s["plan"]["expiry_at"]),
                          "expiry_candles": s["plan"]["expiry_candles"],
-                         "confidence": s["confidence"], "regime": ""},
+                         "confidence": s["confidence"], "regime": "",
+                         "model_version": s.get("model_version", "")},
                         engine="ai", now=int(now))
         text = format_signal(s["res"], s["plan"])
         if send_messages and not args.dry_run:
@@ -177,12 +187,29 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--test", action="store_true", help="send a test Telegram message")
     ap.add_argument("--gate", action="store_true", help="print the go-live stage")
+    ap.add_argument("--readiness", action="store_true",
+                    help="print per-timeframe readiness (req 8 gate)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="print disabled timeframes each scan")
     ap.add_argument("--token", default="")
     ap.add_argument("--chat", default="")
     args = ap.parse_args()
 
     if args.gate:
         print("go-live stage:", gate_stage(args.db, args.journal, args.payout))
+        return
+
+    if args.readiness:
+        sd = SignalData(args.db)
+        args.periods = [int(p) for p in args.periods.split(",") if p]
+        print(f"timeframe readiness — source={args.source}, "
+              f"min_candles={args.min_candles}")
+        for p in args.periods:
+            r = sd.period_readiness(args.source, p, args.min_candles)
+            state = "READY" if r["ready"] else "DISABLED (waiting for data)"
+            print(f"  {p:>5}s: {state} — {r['usable']}/{r['n_assets']} pairs "
+                  f"have >= {r['needed']} candles")
+        sd.close()
         return
 
     if args.test:

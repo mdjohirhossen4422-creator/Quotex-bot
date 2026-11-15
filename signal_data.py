@@ -56,6 +56,21 @@ class SignalData:
             "SELECT COUNT(*) FROM candles WHERE asset=? AND period=?",
             (asset, period)).fetchone()[0]
 
+    def period_readiness(self, source: str, period: int,
+                         min_candles: int) -> dict:
+        """Is this (source, timeframe) usable yet?
+
+        Returns {ready, n_assets, usable, needed}. A period is ready only when at
+        least one pair has `min_candles` closed candles. Long timeframes (5m /
+        15m / 30m) stay NOT ready until the collector has produced enough — the
+        caller disables them rather than emitting a signal from too few candles.
+        """
+        assets = self.assets(source, period, 1)
+        usable = [a for a in assets if self.count(a, period) >= min_candles]
+        return {"ready": bool(usable), "n_assets": len(assets),
+                "usable": len(usable), "needed": min_candles,
+                "period": period, "source": source}
+
     def load(self, asset: str, period: int, limit: int = 0) -> list[list]:
         """Candles (with summary columns) ascending by time."""
         sel = f"time,open,close,high,low"
