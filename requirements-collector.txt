@@ -1,0 +1,10 @@
+# Minimal runtime dependencies for the LIVE COLLECTOR ONLY.
+#
+# `live_collector.py` needs nothing beyond the standard library and a WebSocket
+# client — it does NOT import numpy / scikit-learn / pyarrow (those are only for
+# the offline ML pipeline). Installing just this file keeps the Botkeep build
+# small and fast on a 0.5 vCore / 512 MB free instance.
+#
+# For a Botkeep deploy of the collector, make the workload's `requirements.txt`
+# contain exactly this line. Keep the full `requirements.txt` for the ML work.
+websocket-client>=1.6,<2.0

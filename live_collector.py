@@ -60,7 +60,8 @@ STALE_CANDLE_S = 180.0
 class LiveCollector:
     def __init__(self, db_path: str, pairs: list[str], state_path: str,
                  log_every: float = 60.0, status_every: float = 30.0,
-                 max_backoff: float = 60.0, verbose: bool = False):
+                 max_backoff: float = 60.0, verbose: bool = False,
+                 store_ticks: bool = True):
         self.db_path = db_path
         self.state_path = state_path
         self._pairs = list(pairs)
@@ -68,6 +69,10 @@ class LiveCollector:
         self.status_every = status_every
         self.max_backoff = max_backoff
         self.verbose = verbose
+        # When False, ticks are still received and turned into candles, but the
+        # raw `ticks` table is not written. This keeps the DB ~10x smaller, which
+        # is what makes continuous collection fit a small (1 GiB) volume.
+        self.store_ticks = store_ticks
 
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -87,6 +92,9 @@ class LiveCollector:
         # from the tail of the ticks table. A reconnect replays at most a short
         # recent span, so this window is what stops the duplicate.
         self.dedup_window = 500
+        # Hard cap on the in-memory tick buffer so a stuck writer cannot OOM a
+        # small (512 MB) instance; ~200k rows * ~100 B is tens of MB.
+        self.max_buffer = 200_000
         self._seen: dict[str, set] = defaultdict(set)
         self._seed_dedup()
 
@@ -137,7 +145,9 @@ class LiveCollector:
         return self.conn.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
 
     def _count_pairs(self) -> int:
-        return self.conn.execute("SELECT COUNT(DISTINCT asset) FROM ticks").fetchone()[0]
+        t = self.conn.execute("SELECT COUNT(DISTINCT asset) FROM ticks").fetchone()[0]
+        c = self.conn.execute("SELECT COUNT(DISTINCT asset) FROM candles").fetchone()[0]
+        return max(t, c)
 
     def _seed_dedup(self):
         """Seed the dedup set from each asset's most recent ticks (read-only)."""
@@ -166,11 +176,21 @@ class LiveCollector:
             # bound memory: drop the oldest half (set is unordered, so rebuild
             # from the most recent ticks of this asset).
             self._seen[asset] = set(list(seen)[-self.dedup_window:])
-        with self._lock:
-            self._buf.append((asset, key[0], key[1], d,
-                              classify_source(asset), FEED_ID))
-            self.stats["ticks_received"] += 1
-            self.stats["per_asset"][asset] += 1
+        if self.store_ticks:
+            with self._lock:
+                self._buf.append((asset, key[0], key[1], d,
+                                  classify_source(asset), FEED_ID))
+                self.stats["ticks_received"] += 1
+                self.stats["per_asset"][asset] += 1
+                # Bound RAM on a small instance: if the writer is stuck (e.g. full
+                # disk) the buffer must not grow without limit. Drop the oldest and
+                # count it, so the loss is visible rather than an OOM kill.
+                if len(self._buf) > self.max_buffer:
+                    drop = len(self._buf) - self.max_buffer
+                    for _ in range(drop):
+                        self._buf.popleft()
+                    self.stats["ticks_buffer_dropped"] = \
+                        self.stats.get("ticks_buffer_dropped", 0) + drop
         # Feed the candle builders (1m/5m/15m/30m) from the same tick.
         builders = getattr(self, "_builders", None)
         if builders:
@@ -190,13 +210,20 @@ class LiveCollector:
                 self._buf.clear()
             try:
                 with self._lock:
-                    cur = self.conn.executemany(
+                    self.conn.executemany(
                         "INSERT INTO ticks(asset,ts,price,dir,source,feed_id) "
                         "VALUES(?,?,?,?,?,?)", batch)
                     self.conn.commit()
                 self.stats["ticks_saved"] += len(batch)
             except Exception as e:                       # never lose the loop
-                print(f"  [warn] tick flush failed: {e!r}", flush=True)
+                # The insert is one transaction, so on failure nothing was
+                # committed — put the batch back so the next cycle retries it
+                # instead of silently dropping ticks (e.g. a transient full disk).
+                with self._lock:
+                    self._buf.extendleft(reversed(batch))
+                self.stats["flush_errors"] = self.stats.get("flush_errors", 0) + 1
+                print(f"  [warn] tick flush failed ({len(batch)} buffered): {e!r}",
+                      flush=True)
                 return
             if not wait:
                 return
@@ -225,16 +252,33 @@ class LiveCollector:
         return handler
 
     # ---- heartbeat / report --------------------------------------------- #
+    def _rss_kb(self) -> int:
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1])
+        except OSError:
+            pass
+        return 0
+
     def _snapshot(self) -> dict:
         now = time.time()
         ticks_now = self._count_ticks()
         candles_now = self._count_candles()
         pairs_now = self._count_pairs()
+        db_bytes = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+        wal_bytes = 0
+        for suffix in ("-wal", "-shm"):
+            p = self.db_path + suffix
+            if os.path.exists(p):
+                wal_bytes += os.path.getsize(p)
         return {
             "status": "running" if not self._stop.is_set() else "stopped",
             "updated": datetime.now(timezone.utc).isoformat(),
             "pid": os.getpid(),
             "uptime_s": round(now - self.stats["started"], 1),
+            "rss_kb": self._rss_kb(),
             "connected": getattr(self, "connected", False),
             "session": self.stats.get("session", 0),
             "reconnects": self.stats["reconnects"],
@@ -244,6 +288,8 @@ class LiveCollector:
             "ticks_new": ticks_now - self.baseline_ticks,
             "ticks_saved": self.stats["ticks_saved"],
             "ticks_duplicate": self.stats["ticks_duplicate"],
+            "ticks_buffer_dropped": self.stats.get("ticks_buffer_dropped", 0),
+            "flush_errors": self.stats.get("flush_errors", 0),
             "ticks_pending": len(self._buf),
             "candles_total": candles_now,
             "candles_new": candles_now - self.baseline_candles,
@@ -252,7 +298,9 @@ class LiveCollector:
             "candles_per_period": {str(k): v for k, v in
                                    sorted(self.stats["per_period"].items())},
             "last_tick": self._last_tick or None,
-            "db_bytes": os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0,
+            "db_bytes": db_bytes,
+            "wal_bytes": wal_bytes,
+            "storage_bytes": db_bytes + wal_bytes,
         }
 
     def _write_state(self):
@@ -274,7 +322,8 @@ class LiveCollector:
         print(f"[{time.strftime('%H:%M:%S')}] conn={snap['connected']} "
               f"pairs={snap['pairs']} ticks_new={snap['ticks_new']:,} "
               f"candles_new={snap['candles_new']:,} dup={snap['ticks_duplicate']} "
-              f"reconnects={snap['reconnects']} last={lt_s}", flush=True)
+              f"reconnects={snap['reconnects']} rss={snap['rss_kb']//1024}MB "
+              f"db={snap['storage_bytes']//1048576}MB last={lt_s}", flush=True)
 
     def _maybe_daily_report(self, last_report_day: str) -> str:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -423,19 +472,24 @@ def print_status(state_path: str):
         print("no heartbeat yet")
         return
     snap = json.loads(Path(state_path).read_text())
-    for k in ("status", "updated", "uptime_s", "connected", "pairs",
+    for k in ("status", "updated", "uptime_s", "rss_kb", "connected", "pairs",
               "ticks_new", "candles_new", "ticks_duplicate", "reconnects",
-              "last_tick"):
+              "storage_bytes", "last_tick"):
         print(f"  {k}: {snap.get(k)}")
 
 
 def main():
     ap = argparse.ArgumentParser(description="Continuous live tick collector")
-    ap.add_argument("--db", default="data/candles.db")
-    ap.add_argument("--pairs", default="", help="comma list; default all pairs")
-    ap.add_argument("--minutes", type=float, default=0.0, help="0 = run forever")
-    ap.add_argument("--log-every", type=float, default=60.0)
-    ap.add_argument("--state", default="data/collector_state.json")
+    ap.add_argument("--db", default=os.environ.get("CANDLE_DB", "data/candles.db"))
+    ap.add_argument("--pairs", default=os.environ.get("COLLECTOR_PAIRS", ""),
+                    help="comma list; default all pairs")
+    ap.add_argument("--minutes", type=float, default=float(os.environ.get("COLLECTOR_MINUTES", 0) or 0),
+                    help="0 = run forever")
+    ap.add_argument("--log-every", type=float, default=float(os.environ.get("COLLECTOR_LOG_EVERY", 60) or 60))
+    ap.add_argument("--state", default=os.environ.get("COLLECTOR_STATE", "data/collector_state.json"))
+    ap.add_argument("--no-ticks", dest="store_ticks", action="store_false",
+                    default=os.environ.get("COLLECTOR_STORE_TICKS", "1") not in ("0", "false", "False", ""),
+                    help="store candles only, not raw ticks (~10x smaller DB)")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -446,7 +500,8 @@ def main():
 
     pairs = [a for a in args.pairs.split(",") if a]
     coll = LiveCollector(args.db, pairs, args.state,
-                         log_every=args.log_every, verbose=args.verbose)
+                         log_every=args.log_every, verbose=args.verbose,
+                         store_ticks=args.store_ticks)
     coll.run(minutes=args.minutes)
 
 

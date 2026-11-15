@@ -175,6 +175,26 @@ def test_schema_is_extended_additively_only():
         print("PASS test_schema_is_extended_additively_only")
 
 
+def test_store_ticks_false_writes_candles_not_ticks():
+    """--no-ticks mode: candles are built and stored, raw ticks are not."""
+    with tempfile.TemporaryDirectory() as d:
+        db = os.path.join(d, "t.db")
+        c = LiveCollector(db, [], db + ".state.json", log_every=999,
+                          store_ticks=False)
+        c._assets = ["EURUSD_otc"]
+        c._asset_set = set(c._assets)
+        c._builders = {(a, p): CandleBuilder(p, on_closed=c._candle_cb(a, p))
+                       for a in c._assets for p in CANDLE_PERIODS}
+        for k in range(120):
+            c._on_tick("EURUSD_otc", 1000.0 + k, 1.0 + k * 1e-4, 1)
+        c._flush(wait=True)
+        assert _ticks(db, "EURUSD_otc") == [], "ticks were stored in --no-ticks mode"
+        candles = c.conn.execute(
+            "SELECT COUNT(*) FROM candles WHERE period=60").fetchone()[0]
+        assert candles >= 1, "no candle built in --no-ticks mode"
+        print("PASS test_store_ticks_false_writes_candles_not_ticks")
+
+
 def test_negative_control_dedup_does_not_overdrop():
     """A guard that dedup cannot be too aggressive: distinct ticks all survive."""
     with tempfile.TemporaryDirectory() as d:
@@ -196,5 +216,6 @@ if __name__ == "__main__":
     test_existing_rows_never_modified()
     test_market_separation_in_stored_source()
     test_schema_is_extended_additively_only()
+    test_store_ticks_false_writes_candles_not_ticks()
     test_negative_control_dedup_does_not_overdrop()
     print("\nall live-collector tests passed")
