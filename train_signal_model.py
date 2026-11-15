@@ -71,8 +71,13 @@ def _model():
 
 def walk_forward_score(X: np.ndarray, y: np.ndarray, n_splits: int,
                        min_train: float, embargo: int, payout: float):
-    """Expanding-window OOS outcomes, pooled. Returns (outcomes, per_fold, aucs)."""
-    outcomes, aucs, folds = [], [], []
+    """Expanding-window OOS outcomes, pooled.
+
+    Returns (outcomes, folds, aucs, probs, labels). `probs`/`labels` are the raw
+    out-of-sample confidences and true labels, so a caller can ask whether acting
+    only on high-confidence rows actually raises the hit-rate.
+    """
+    outcomes, aucs, folds, probs, labels = [], [], [], [], []
     for k, (tr0, tr_end, te_start, te_end) in enumerate(
             make_folds(len(X), n_splits, min_train, embargo)):
         if tr_end < 100 or te_end > len(X):
@@ -86,6 +91,9 @@ def walk_forward_score(X: np.ndarray, y: np.ndarray, n_splits: int,
         pred = (prob >= 0.5).astype(int)
         for p, yy in zip(pred, yte):
             outcomes.append(bool(p == yy))
+        for p, yy in zip(prob, yte):
+            probs.append(float(p))
+            labels.append(int(yy))
         try:
             from sklearn.metrics import roc_auc_score
             aucs.append(float(roc_auc_score(yte, prob)))
@@ -93,7 +101,30 @@ def walk_forward_score(X: np.ndarray, y: np.ndarray, n_splits: int,
             pass
         folds.append({"fold": k, "n_train": int(tr_end), "n_test": int(te_end - te_start),
                       "hit": float(np.mean(pred == yte))})
-    return outcomes, folds, aucs
+    return outcomes, folds, aucs, probs, labels
+
+
+def confidence_buckets(probs: list[float], labels: list[int],
+                       edges=(0.50, 0.55, 0.60, 0.65, 0.70, 1.01)) -> list[dict]:
+    """Hit-rate per confidence band, with sample size.
+
+    This is the honest test of "does filtering by confidence raise accuracy?".
+    A band whose hit-rate is not clearly above the payout breakeven — or whose n
+    is tiny — is not evidence of an edge. Nothing is tuned here; the edges are
+    fixed.
+    """
+    out = []
+    for lo, hi in zip(edges, edges[1:]):
+        hit = tot = 0
+        for p, y in zip(probs, labels):
+            conf = max(p, 1 - p)
+            if lo <= conf < hi:
+                pred = 1 if p >= 0.5 else 0
+                hit += int(pred == y)
+                tot += 1
+        out.append({"conf_lo": lo, "conf_hi": hi, "n": tot,
+                    "hit": (hit / tot) if tot else None})
+    return out
 
 
 def coin_control(n: int, payout: float, seed: int = 0):
@@ -126,8 +157,8 @@ def train(source: str, period: int, db: str, mtf_period: int,
         return report
 
     # out-of-sample walk-forward (time-ordered, purged)
-    outcomes, folds, aucs = walk_forward_score(X, y, n_splits, min_train,
-                                               embargo, payout)
+    outcomes, folds, aucs, probs, labels = walk_forward_score(
+        X, y, n_splits, min_train, embargo, payout)
     oos = metrics_from_outcomes(outcomes, payout, name=f"{source}-{period}s",
                                 source=source)
     control = coin_control(len(outcomes), payout)
@@ -138,6 +169,7 @@ def train(source: str, period: int, db: str, mtf_period: int,
         "auc_mean": float(np.mean(aucs)) if aucs else None,
         "control": control.as_dict(),
         "baseline_up_rate": float(np.mean(y)),
+        "confidence_buckets": confidence_buckets(probs, labels),
     })
 
     # final model on ALL rows (this is what live inference loads)
@@ -152,6 +184,12 @@ def train(source: str, period: int, db: str, mtf_period: int,
                          "n_rows": n, "data_span": span}, f)
         report["model_path"] = path
     print(_format(report))
+    if report.get("confidence_buckets"):
+        print("  confidence buckets (OOS):")
+        for b in report["confidence_buckets"]:
+            h = "n/a" if b["hit"] is None else f"{b['hit']*100:.1f}%"
+            print(f"    conf {b['conf_lo']:.2f}-{b['conf_hi']:.2f}: "
+                  f"n={b['n']:>5}  hit={h}")
     _write(report, source, period, write)
     return report
 

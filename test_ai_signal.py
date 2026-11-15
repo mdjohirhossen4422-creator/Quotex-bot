@@ -180,6 +180,21 @@ def test_negative_control_random_walk_heuristic_is_not_strong():
     print("PASS test_negative_control_random_walk_heuristic_is_not_strong")
 
 
+def test_confidence_buckets_are_honest():
+    from train_signal_model import confidence_buckets
+    # perfect separation: high confidence -> all correct, low -> coin
+    probs = [0.9, 0.85, 0.1, 0.15, 0.52, 0.48]
+    labels = [1, 1, 0, 0, 1, 0]           # first four correct, last two 50/50
+    buckets = confidence_buckets(probs, labels)
+    high = [b for b in buckets if b["conf_lo"] == 0.70][0]   # top band
+    # conf = max(p, 1-p): 0.9/0.85 (up) and 0.1/0.15 (down) all land >=0.85
+    assert high["n"] == 4 and high["hit"] == 1.0, high
+    # a bucket with no rows reports None, not a fabricated 0
+    empty = [b for b in buckets if b["conf_lo"] == 0.65][0]
+    assert empty["hit"] is None and empty["n"] == 0, empty
+    print("PASS test_confidence_buckets_are_honest")
+
+
 if __name__ == "__main__":
     test_features_are_causal()
     test_momentum_is_learned_random_is_not()
@@ -187,4 +202,5 @@ if __name__ == "__main__":
     test_engine_uses_model_and_abstains_on_low_confidence()
     test_engine_falls_back_to_heuristic_without_model()
     test_negative_control_random_walk_heuristic_is_not_strong()
+    test_confidence_buckets_are_honest()
     print("\nall AI-signal tests passed")

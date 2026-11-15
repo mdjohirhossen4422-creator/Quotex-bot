@@ -1246,6 +1246,22 @@ same trainer/backtest reaches **~67–72% OOS** (AUC ~0.78); on a **random walk*
 shows no edge. So the code learns when a pattern exists — on this feed there is no
 pattern to learn, which matches every earlier phase.
 
+**Confidence is not calibrated (the key honest finding).** `train_signal_model`
+now prints an OOS confidence-bucket table, which is the honest test of "does
+acting only on high-confidence signals raise accuracy?". On OTC 60s it does the
+opposite — the *most* confident band is the *worst*:
+
+    conf 0.50-0.55: n=4652  hit=50.1%
+    conf 0.55-0.60: n=1392  hit=51.3%
+    conf 0.60-0.65: n= 518  hit=50.4%
+    conf 0.65-0.70: n= 201  hit=49.3%
+    conf 0.70-1.01: n= 167  hit=46.7%   <- highest confidence, worst hit-rate
+
+So `--min-confidence` on this feed cannot be sold as an accuracy win: raising it
+just shrinks the sample (same result as `selective.py` §6). This is why the
+default Telegram mode is paper — the gate, not the confidence knob, is what
+decides when live is justified.
+
 ### Priorities 9–10 — Telegram, paper first
 `signal_telegram.py`: default mode **paper** (journals + prints, never sends).
 `--mode live` sends only if `golive.gate()` reports **LIVE-READY**; otherwise it
