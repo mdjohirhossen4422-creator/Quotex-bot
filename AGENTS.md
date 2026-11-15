@@ -47,6 +47,13 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # 2) EMA + indicator signal bot
 .venv/bin/python signal_bot.py EURUSD_otc 60 --threshold 4
+
+# 3) ML: download history, train, predict (CLI)
+.venv/bin/python market_data.py EURUSD 1h     # download + clean + quality
+.venv/bin/python ml_engine.py EURUSD 1h       # walk-forward score + UP/DOWN call
+
+# 4) the web dashboard (ML "Get Analysis" + live scan + journal + gate)
+./run_dashboard.sh                             # then open the work-host URL
 ```
 
 Use the project-local `.venv`: system site-packages can be wiped when the
@@ -83,7 +90,9 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `market_qx_candles.py` | WS client + `CandleBuilder` (live tick -> OHLC candles) |
 | `indicators.py` | pure-python EMA/SMA/RSI/MACD/Bollinger/ATR/Stochastic |
 | `signal_bot.py` | rule-based EMA + indicator confluence, emits CALL/PUT alerts |
-| `dashboard.py` | multi-pair web dashboard: pair + timeframe select, Analyze button |
+| `dashboard.py` | multi-pair web dashboard: market + timeframe select, **Get Analysis** (ML) button, scan, journal, gate |
+| `market_data.py` | historical OHLC downloader (Yahoo Finance chart API), clean + disk cache; **aggregates 1d from 1h** to dodge Yahoo's broken FX daily bars |
+| `ml_engine.py` | online ML: download → clean → 26 features → 3-model ensemble → purged walk-forward score → next-candle UP/DOWN call; background jobs + cache |
 | `candle_store.py` | SQLite candle store + `MultiFeed` (one ws -> all pairs/periods) |
 | `analysis.py` | `analyze(asset, period, candles)` -> explainable verdict |
 | `smart_engine.py` | regime-aware engine (ADX + volatility + breakout), 0..1 confidence |
@@ -151,6 +160,8 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_decision.py` | weighted voting, EV gate, every NO TRADE condition, reliability weights |
 | `test_intelligence.py` | intelligence read shape, causality, and the random-walk negative control |
 | `test_features_v2.py` | feature shape/uniqueness, label correctness, causality, random-walk control |
+| `test_market_data.py` | aggregation OHLC math, cleaning, the open==close defect gate, catalog, optional live fetch |
+| `test_ml_engine.py` | feature causality, walk-forward negative (random walk) + positive (momentum) controls, train bundle, cache, job manager, consensus |
 
 ## P0/P1 — provenance, payout, and the validation harness (2026-11-07)
 
@@ -255,6 +266,53 @@ the live tick stream, so a timeframe needs `52 x period` seconds of uptime
 before the first signal: ~4 min on 5s, ~52 min on 1m. The UI shows a progress bar
 and ETA, and auto-fires the analysis once enough candles exist. History
 accumulates in SQLite across restarts, so leave it running.
+
+## ML signal mode — Get Analysis (2026-11-15)
+
+The dashboard's headline flow is now: **pick a market → pick a timeframe (or
+"All timeframes") → press Get Analysis**. Instead of waiting for the live feed to
+accumulate candles, the bot downloads real historical candles, cleans them,
+trains an ensemble, scores it honestly, and predicts the next candle's direction.
+
+- `market_data.py` — downloads from Yahoo Finance's public chart endpoint (no
+  key, no login) for every instrument in the catalog. Cleans (dedupe, drop
+  non-finite / high<low / non-positive, flat / gap / robust-spike filters) and
+  caches to `data/history/` (`CACHE_TTL`).
+- `ml_engine.py` — `build_features()` (26 features, one causal pass), a 3-model
+  soft-voting ensemble (GradientBoosting + RandomForest + LogisticRegression),
+  an expanding-window **walk-forward** score vs the majority-class baseline, and
+  the next-candle UP/DOWN call. Training runs in a background thread
+  (`start_job`/`job_status`) so the UI shows a progress bar instead of hanging;
+  results are cached 15 min per (pair, timeframe). Fits only the most recent
+  10k rows to stay a few seconds per request.
+- **The signal is about the *next* candle.** `build_features()` returns one extra
+  feature row for the newest candle (no label yet); `train()` predicts from that
+  row, so the call is always for the candle that has not closed. `walk_forward`
+  drops that unlabeled row before scoring. Locked by
+  `test_ml_engine.test_signal_targets_next_candle`.
+- Endpoints: `/api/ml_catalog` (pairs + timeframes), `/api/ml_train?pair=&tf=`
+  (starts a job), `/api/ml_job?id=` (polls progress + result).
+- "All timeframes" trains 15m + 1h + 1d and combines them by majority vote
+  (`train_all` → consensus, ties break toward the higher-confidence model).
+
+### The Yahoo daily-FX trap (fixed — do not reintroduce)
+
+Yahoo's **native daily bars for FX pairs are structurally broken**: on ~40% of
+them `open == close`, and the high/low barely contain the body. A model fed
+those bars "learns" that a long upper wick means the next day falls and reports
+a fake **~80% accuracy / AUC ~0.87** on EURUSD, GBPUSD, USDJPY, AUDUSD — while
+the same rule on clean data is a coin flip. It is a data artifact, not an edge.
+
+The fix: `TIMEFRAME_PLAN["1d"] = ("1h", "730d", 86400)` — fetch hourly bars and
+`aggregate()` them into daily ones. Aggregated daily bars give the honest ~52%
+and the model reports NO EDGE / BELOW BASELINE, as it should. `clean()` also
+computes `oc_equal_ratio` and fails a series (so it is never trained on) when
+>45% of bars have `open == close`. `test_market_data.py` locks both behaviours.
+
+Verify the fix yourself:
+
+    .venv/bin/python market_data.py EURUSD 1d     # oc_equal_ratio should be small
+    .venv/bin/python ml_engine.py EURUSD 1d        # verdict: NO EDGE / BELOW
 
 ## Telegram signal alerts
 
