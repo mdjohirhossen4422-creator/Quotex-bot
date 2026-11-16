@@ -121,8 +121,10 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `discipline.py` | **market-understanding + discipline** bot: a 7-gate checklist over data/regime/structure/confluence; abstains by default, "candidate" until the journal proves an edge |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
+| `signal_ask.py` | **on-demand** Telegram signals: `/signal <pair> <tf>` -> BUY/SELL/WAIT |
 | `run_dashboard.sh` | starts the dashboard on the public work host |
 | `run_alerts.sh` | starts the Telegram alert watcher |
+| `run_ask.sh` | starts the on-demand Telegram signal bot |
 | `collect_data.py` | records live candles to a CSV (resumable) |
 | `features.py` | turns candles into the model's feature vector |
 | `train_model.py` | trains the up/down classifier with walk-forward validation |
@@ -1467,3 +1469,24 @@ Key facts (verified 2026-11 against Render docs):
   `test_deploy_render.py` and a local `docker build`.
 
 The image was built and run locally: `conn=True`, live prices received, 180 MB.
+
+## On-demand Telegram signals (`signal_ask.py`, 2026-11-08)
+
+The user's goal: **ask when they want, get BUY / SELL / WAIT** — not a push
+stream. `alerts.py` pushes; `signal_ask.py` answers on request.
+
+- Long-polls `getUpdates` (deletes any webhook first, else polling returns
+  nothing), replies only to `TELEGRAM_CHAT_ID` if one is set.
+- Commands: `/signal <pair> [tf]`, `/pairs`, `/help`, `/start`.
+- Verdict mapping: `CALL -> BUY`, `PUT -> SELL`, `NEUTRAL -> WAIT`. Same engines
+  as the dashboard/scan (`--engine rule|smart|pa|ensemble`).
+- Reads candles the collector already stored, so the collector must be running
+  for the pair+timeframe asked about; a stale series (>3 candles old) is flagged
+  with a warning instead of a silent wrong read.
+- Offset persisted in `data/ask_state.json`; pair lookup tolerates case and a
+  missing `_otc` suffix.
+- Offline check with no Telegram: `python signal_ask.py --text '/signal EURUSD_otc 60'`.
+- Run with `./run_ask.sh` (long-poll) — same credential setup as `alerts.py`.
+
+Honest limit unchanged: every engine measures ~50% on this feed (see the
+evaluation sections above). The bot shows the indicator read; it is not an edge.

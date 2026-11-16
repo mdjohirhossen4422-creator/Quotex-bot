@@ -16,7 +16,38 @@ CALL / PUT signals with an entry time and expiry time.
   direction. Entry is snapped to the next candle boundary and is never in the
   past.
 - **History** — candles persist in `data/candles.db` (the only durable asset).
-- **Telegram alerts** — optional, via `alerts.py`.
+- **Telegram alerts** — optional, via `alerts.py` (push).
+- **On-demand signals** — ask in Telegram, get BUY / SELL / WAIT, via
+  `signal_ask.py` (you pull, the bot answers).
+
+## Ask for a signal (on-demand)
+
+`alerts.py` *pushes* a message when a signal appears. If you'd rather ask only
+when you want, run the on-demand bot instead:
+
+```bash
+export TELEGRAM_BOT_TOKEN=123456:ABC...
+export TELEGRAM_CHAT_ID=987654321
+./run_ask.sh --engine smart
+```
+
+Then message the bot:
+
+```
+/signal EURUSD_otc 60     ->  🟢 BUY / 🔴 SELL / ⚪ WAIT for that pair+timeframe
+/signal EURUSD_otc        ->  uses the default timeframe
+/pairs                    ->  pairs that currently have enough candles
+/help                     ->  usage
+```
+
+It reads candles the collector has already stored, so the collector must be
+running for the pair+timeframe you ask about. If the data is stale it says so.
+Test it offline (no Telegram) with:
+
+```bash
+python signal_ask.py --text '/signal EURUSD_otc 60'
+```
+
 
 ## Run it
 
@@ -39,7 +70,8 @@ For a permanent public `https://` link, see **[DEPLOY.md](DEPLOY.md)**.
 python scan.py 5                   # scan 5s pairs
 python scan.py --all-tf --top 12   # every timeframe
 python scan.py 60 --expiry 3       # 3-candle expiry
-python alerts.py --periods all --engine smart   # Telegram loop
+python alerts.py --periods all --engine smart   # Telegram loop (push)
+python signal_ask.py --engine smart            # Telegram on-demand (pull)
 python journal.py --report         # your live track record
 python golive.py --report          # demo -> real money readiness gate
 ```
