@@ -76,6 +76,22 @@ def test_preflight_treats_warn_as_non_fatal():
     print("PASS test_preflight_treats_warn_as_non_fatal")
 
 
+def test_proxy_option_parsing():
+    import market_qx_candles as m
+    assert m.MarketQX(proxy="")._proxy_opts() == {}
+    assert m.MarketQX(proxy="host:3128")._proxy_opts() == {
+        "http_proxy_host": "host", "http_proxy_port": 3128}
+    assert m.MarketQX(proxy="socks5://host:1080")._proxy_opts() == {
+        "http_proxy_host": "host", "http_proxy_port": 1080, "proxy_type": "socks5"}
+    assert m.MarketQX(proxy="socks5://u:p@host:1080")._proxy_opts() == {
+        "http_proxy_host": "host", "http_proxy_port": 1080,
+        "proxy_type": "socks5", "http_proxy_auth": ("u", "p")}
+    assert m.MarketQX(proxy="http://u:p@host:3128")._proxy_opts() == {
+        "http_proxy_host": "host", "http_proxy_port": 3128,
+        "http_proxy_auth": ("u", "p")}
+    print("PASS test_proxy_option_parsing")
+
+
 def test_trader_shim_runs_collector_status():
     """The Botkeep egg runs `python trader.py`; the shim must forward to the
     collector. `--status` is a no-feed path, so it is safe to run here."""
@@ -101,5 +117,6 @@ if __name__ == "__main__":
     test_build_is_self_contained_and_clean()
     test_bundled_modules_import_from_archive()
     test_preflight_treats_warn_as_non_fatal()
+    test_proxy_option_parsing()
     test_trader_shim_runs_collector_status()
     print("\nall package-botkeep tests passed")

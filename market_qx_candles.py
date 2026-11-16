@@ -105,11 +105,12 @@ class MarketQX:
     ORIGIN = "https://market-qx.info"
 
     def __init__(self, ssid: str = "", host: str = HOST, origin: str = ORIGIN,
-                 verbose: bool = False):
+                 verbose: bool = False, proxy: str = ""):
         self.ssid = ssid
         self.host = host
         self.origin = origin
         self.verbose = verbose
+        self.proxy = proxy or os.environ.get("QX_PROXY", "")
         self.url = f"wss://{host}/socket.io/?EIO=3&transport=websocket"
 
         self.instruments: dict[str, dict] = {}
@@ -140,10 +141,40 @@ class MarketQX:
                            "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"),
         }
 
+    def _proxy_opts(self) -> dict:
+        """Parse QX_PROXY (or self.proxy) into websocket-client kwargs.
+
+        Accepts "host:port", "scheme://host:port", or
+        "scheme://user:pass@host:port". scheme http/https -> HTTP CONNECT,
+        socks5/socks4 -> SOCKS proxy. Empty -> direct connection.
+        """
+        p = self.proxy.strip()
+        if not p:
+            return {}
+        scheme = "http"
+        if "://" in p:
+            scheme, p = p.split("://", 1)
+        auth = None
+        if "@" in p:
+            cred, p = p.rsplit("@", 1)
+            if ":" in cred:
+                u, pw = cred.split(":", 1)
+                auth = (u, pw)
+        if ":" not in p:
+            raise ValueError(f"QX_PROXY needs host:port, got {self.proxy!r}")
+        host, port = p.rsplit(":", 1)
+        opts = {"http_proxy_host": host, "http_proxy_port": int(port)}
+        if scheme.startswith("socks"):
+            opts["proxy_type"] = scheme
+        if auth:
+            opts["http_proxy_auth"] = auth
+        return opts
+
     def connect(self, wait_instruments: float = 75.0) -> "MarketQX":
         self._ws = websocket.create_connection(
             self.url, header=self._headers(), timeout=20,
             sslopt={"cert_reqs": ssl.CERT_NONE},
+            **self._proxy_opts(),
         )
         self._ws.settimeout(3)
         self._ws.recv()  # Engine.IO open: 0{"sid":...}

@@ -65,6 +65,7 @@ Deliberately **excluded**: `.env`, `telegram.json`, `payout.json`, `.git`,
 | `COLLECTOR_STORE_TICKS` | `0` | same as `--no-ticks` (belt and braces) |
 | `COLLECTOR_LOG_EVERY` | `60` | stdout log cadence |
 | `COLLECTOR_PAIRS` | *(unset = all)* | optional: `EURUSD_otc,BTCUSD_otc` to shrink scope |
+| `QX_PROXY` | *(unset = direct)* | optional: route the feed via a proxy if the host IP is blocked, e.g. `socks5://user:pass@host:1080` |
 
 No secret is needed to collect. **Do not** add a Telegram token here — this
 package is collector-only, and the AI Telegram path stays in paper mode.
@@ -119,6 +120,38 @@ collector stopped, since the feed is single-session per IP):
 ```
 python verify_restart.py --minutes 2.5 --pairs EURUSD_otc
 ```
+
+## If the console shows `403 Forbidden` (geo/Cloudflare block)
+
+Symptom in the Console, repeating:
+
+```
+feed error: WebSocketBadStatusException("Handshake status 403 Forbidden ...")
+```
+
+That is **not** a code or dependency problem — the bundle started correctly. It
+means Cloudflare is refusing the WebSocket handshake **from the server's IP**.
+The `cf-ray` header ends in the colo code (e.g. `-WAW` = Warsaw), and the reply
+carries a `__cf_bm` cookie (Cloudflare Bot Management). Quotex/market-qx geo-gates
+some regions, so a server in a blocked region gets `403` while the same client
+works from an allowed region.
+
+The collector supports routing the feed through a proxy. Add `QX_PROXY` in the
+panel Environment (or pass `--proxy`):
+
+```
+QX_PROXY=socks5://user:pass@HOST:1080
+QX_PROXY=http://user:pass@HOST:3128
+```
+
+Use a proxy whose exit IP is in an **allowed region** (e.g. US/EU where the site
+loads). Then restart. To confirm reachability without starting the collector:
+
+```
+python live_collector.py --proxy "$QX_PROXY" --minutes 0.5 --pairs EURUSD_otc
+```
+
+The same client connects fine from an allowed IP, so a working proxy resolves it.
 
 ## Honest scope
 

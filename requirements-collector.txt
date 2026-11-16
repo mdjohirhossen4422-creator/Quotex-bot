@@ -8,3 +8,6 @@
 # For a Botkeep deploy of the collector, make the workload's `requirements.txt`
 # contain exactly this line. Keep the full `requirements.txt` for the ML work.
 websocket-client>=1.6,<2.0
+# python-socks is only needed for SOCKS proxies (QX_PROXY=socks5://...).
+# HTTP CONNECT proxies (http://...) work with websocket-client alone.
+python-socks[asyncio]>=2.4,<3

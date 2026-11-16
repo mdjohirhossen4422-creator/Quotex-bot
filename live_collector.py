@@ -62,7 +62,7 @@ class LiveCollector:
     def __init__(self, db_path: str, pairs: list[str], state_path: str,
                  log_every: float = 60.0, status_every: float = 30.0,
                  max_backoff: float = 60.0, verbose: bool = False,
-                 store_ticks: bool = True):
+                 store_ticks: bool = True, proxy: str = ""):
         self.db_path = db_path
         self.state_path = state_path
         self._pairs = list(pairs)
@@ -70,6 +70,7 @@ class LiveCollector:
         self.status_every = status_every
         self.max_backoff = max_backoff
         self.verbose = verbose
+        self.proxy = proxy or os.environ.get("QX_PROXY", "")
         # When False, ticks are still received and turned into candles, but the
         # raw `ticks` table is not written. This keeps the DB ~10x smaller, which
         # is what makes continuous collection fit a small (1 GiB) volume. Tick
@@ -361,7 +362,7 @@ class LiveCollector:
         # Retry instrument discovery; fall back to stored pairs if empty.
         qx = None
         for attempt in range(3):
-            qx = MarketQX().connect(wait_instruments=40)
+            qx = MarketQX(proxy=self.proxy).connect(wait_instruments=40)
             if qx.instruments:
                 break
             qx.close()
@@ -515,6 +516,10 @@ def main():
                     default=os.environ.get("COLLECTOR_STORE_TICKS", "1") not in ("0", "false", "False", ""),
                     help="store candles only, not raw ticks (~10x smaller DB)")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--proxy", default=os.environ.get("QX_PROXY", ""),
+                    help="route the feed through a proxy, e.g. "
+                         "socks5://user:pass@host:1080 or http://host:3128 "
+                         "(needed when the host IP is geo/Cloudflare-blocked)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -525,7 +530,7 @@ def main():
     pairs = [a for a in args.pairs.split(",") if a]
     coll = LiveCollector(args.db, pairs, args.state,
                          log_every=args.log_every, verbose=args.verbose,
-                         store_ticks=args.store_ticks)
+                         store_ticks=args.store_ticks, proxy=args.proxy)
     coll.run(minutes=args.minutes)
 
 

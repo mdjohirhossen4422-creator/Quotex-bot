@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import socket
+import ssl
 import sqlite3
 import sys
 from pathlib import Path
@@ -56,13 +56,37 @@ def check_imports():
                else f"missing {missing}", "PASS" if not missing else "FAIL")
 
 
-def check_feed():
+def check_feed(proxy: str = ""):
+    """Do a real WebSocket handshake, not just a TCP connect.
+
+    Cloudflare answers the TCP connection but returns `403` on the *handshake*
+    when the source IP is geo/Cloudflare-blocked. A bare TCP probe would PASS and
+    hide that, so this performs the actual upgrade and reports the status.
+    """
     try:
-        s = socket.create_connection((FEED_HOST, FEED_PORT), timeout=10)
-        s.close()
-        return _ok("feed", f"tcp {FEED_HOST}:{FEED_PORT} reachable")
-    except OSError as e:
-        return _ok("feed", f"cannot reach {FEED_HOST}:{FEED_PORT}: {e}", "FAIL")
+        import websocket
+        from market_qx_candles import MarketQX
+    except ImportError as e:
+        return _ok("feed", f"cannot import websocket client: {e}", "FAIL")
+
+    qx = MarketQX(proxy=proxy)
+    url = "wss://%s/socket.io/?EIO=3&transport=websocket" % FEED_HOST
+    try:
+        ws = websocket.create_connection(
+            url, header=qx._headers(), timeout=15,
+            sslopt={"cert_reqs": ssl.CERT_NONE}, **qx._proxy_opts())
+        ws.close()
+        via = f" via {proxy}" if proxy else ""
+        return _ok("feed", f"handshake OK to {FEED_HOST}{via}")
+    except websocket.WebSocketBadStatusException as e:
+        status = getattr(e, "status_code", None)
+        hint = ""
+        if status == 403:
+            hint = (" — Cloudflare is refusing this IP (geo/bot block). "
+                    "Set QX_PROXY to an allowed-region proxy and retry.")
+        return _ok("feed", f"handshake HTTP {status} from {FEED_HOST}{hint}", "FAIL")
+    except Exception as e:
+        return _ok("feed", f"cannot reach {FEED_HOST}: {type(e).__name__}: {e}", "FAIL")
 
 
 def _db_bytes(db: str) -> int:
@@ -135,6 +159,8 @@ def main():
                                                       "data/collector_state.json"))
     ap.add_argument("--storage-mb", type=int, default=1024)
     ap.add_argument("--ram-mb", type=int, default=512)
+    ap.add_argument("--proxy", default=os.environ.get("QX_PROXY", ""),
+                    help="test the feed handshake through this proxy")
     args = ap.parse_args()
 
     print(f"Botkeep preflight — db={args.db} storage={args.storage_mb}MB "
@@ -142,7 +168,7 @@ def main():
     results = [
         check_python(),
         check_imports(),
-        check_feed(),
+        check_feed(args.proxy),
         check_storage(args.db, args.storage_mb),
         check_ram(args.ram_mb),
         check_paths(args.db, args.state),
