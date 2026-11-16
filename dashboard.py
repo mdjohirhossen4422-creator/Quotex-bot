@@ -106,11 +106,11 @@ PAGE = """<!doctype html>
       </div>
       <div style="margin-top:10px"><label>Engine</label>
         <select id="engine">
+          <option value="discipline" selected>Discipline (real-trade gate — abstains by default)</option>
           <option value="rule">Rule (indicator votes)</option>
           <option value="smart">Smart (regime + volatility)</option>
           <option value="ensemble">Ensemble (SMC + trend + momentum)</option>
           <option value="pa">Price Action + SMC (no training)</option>
-          <option value="discipline">Discipline (real-trade gate — abstains by default)</option>
         </select>
       </div>
       <button id="go">Analyze</button>
