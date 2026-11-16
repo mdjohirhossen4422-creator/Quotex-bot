@@ -224,8 +224,9 @@ def main():
                     help="smart engine: only alert at/above this confidence")
     ap.add_argument("--expiry", type=int, default=1, metavar="N",
                     help="expiry in candles after entry, shown in the alert")
-    ap.add_argument("--engine", choices=["rule", "smart", "pa"], default="rule",
-                    help="rule=indicator votes; smart=regime+vol; pa=price action+SMC")
+    ap.add_argument("--engine", choices=["rule", "smart", "pa", "ensemble", "discipline"], default="rule",
+                    help="rule=indicator votes; smart=regime+vol; pa=price action+SMC; "
+                         "ensemble=SMC+trend+momentum; discipline=abstain-by-default gate")
     ap.add_argument("--gate", action="store_true",
                     help="meta-labeling filter: drop signals the model expects to lose")
     ap.add_argument("--gate-threshold", type=float, default=0.55,

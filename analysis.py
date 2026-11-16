@@ -223,3 +223,55 @@ def analyze(asset: str, period: int, candles: list[list],
 
 def _r(v, nd: int = 5):
     return round(v, nd) if isinstance(v, (int, float)) else None
+
+
+def analyze_discipline(asset: str, period: int, candles: list[list],
+                       strategy=None) -> Analysis:
+    """Real-trade discipline gate (`discipline.assess`).
+
+    This is the **abstain-by-default** engine: it runs a 7-gate checklist
+    (data quality, regime, structure, confluence, agreement, strength) and
+    returns NEUTRAL unless every gate passes. When they do, it still labels the
+    read a *candidate* until the live journal has *measured* a payout-adjusted
+    edge for this timeframe — so it never presents an unproven setup as a
+    tradeable signal. Same `Analysis` shape as the other adapters.
+    """
+    from discipline import assess, edge_proven, DisciplineConfig, NO_TRADE
+    from pabot import PAEngine, PAStrategy
+
+    cfg = strategy if isinstance(strategy, DisciplineConfig) else DisciplineConfig()
+    need = PAEngine(PAStrategy()).s.min_candles()
+    res = Analysis(asset=asset, period=period, candles=len(candles),
+                   enough=len(candles) >= need, engine="discipline")
+    if not res.enough:
+        res.note = (f"need {need} candles, have {len(candles)} — "
+                    f"let it stream for {(need - len(candles)) * period}s more")
+        return res
+
+    try:
+        proven, edge = edge_proven(period, cfg)
+    except Exception:
+        proven, edge = False, {"decisive": 0, "hit": 0.0, "ci": [0.0, 0.0],
+                               "breakeven": cfg.breakeven()}
+    st = assess(None, asset, period, cfg, candles=candles, proven=proven)
+
+    res.action = "NEUTRAL" if st.action == NO_TRADE else st.action
+    res.confidence = st.confidence
+    res.score = round(st.confidence * 10)
+    res.regime = st.regime
+    res.bull = sum(1 for v in st.blocks.values() if v == "CALL")
+    res.bear = sum(1 for v in st.blocks.values() if v == "PUT")
+    res.reasons = list(st.reasons) + [
+        f"{'✓' if ok else '✗'} {name}: {detail}" for name, ok, detail in st.checks]
+    res.values = {"price": st.price, "last_candle_time": st.time,
+                  "structure": st.structure, "quality": round(st.quality, 3),
+                  "blocks": st.blocks}
+    if st.status == "no_trade":
+        res.note = "NO TRADE — blocked by: " + ", ".join(st.blocked_by)
+    elif st.status == "candidate":
+        res.note = (f"CANDIDATE (edge not yet proven): {edge['decisive']} settled, "
+                    f"hit {edge['hit']:.1%}, CI {edge['ci'][0]:.1%}–{edge['ci'][1]:.1%} "
+                    f"vs breakeven {edge['breakeven']:.1%}")
+    else:
+        res.note = f"SIGNAL — edge proven ({edge['decisive']} settled, hit {edge['hit']:.1%})"
+    return res

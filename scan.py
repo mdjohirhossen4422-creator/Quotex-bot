@@ -27,7 +27,7 @@ import json
 import os
 import time
 
-from analysis import analyze, analyze_smart, analyze_ensemble, analyze_pa
+from analysis import analyze, analyze_smart, analyze_ensemble, analyze_pa, analyze_discipline
 from candle_store import CandleStore, PERIODS
 from payout import DEFAULT_PAYOUT
 
@@ -110,6 +110,7 @@ def scan_all(store: CandleStore, periods: list[int], engine: str = "rule",
     fn = (analyze_smart if engine == "smart"
           else analyze_ensemble if engine == "ensemble"
           else analyze_pa if engine == "pa"
+          else analyze_discipline if engine == "discipline"
           else analyze)
     pairs = store.series(min_candles=min_candles, periods=periods)
     now = time.time()
@@ -248,7 +249,7 @@ def main():
     ap.add_argument("--db", default="data/candles.db")
     ap.add_argument("--top", type=int, default=12)
     ap.add_argument("--all", action="store_true", help="also list NEUTRAL rows")
-    ap.add_argument("--engine", choices=["rule", "smart", "ensemble", "pa"],
+    ap.add_argument("--engine", choices=["rule", "smart", "ensemble", "pa", "discipline"],
                     default="rule")
     ap.add_argument("--min-candles", type=int, default=0,
                     help="only scan series with at least this many candles")

@@ -161,6 +161,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_combine.py` | combine.py: label correctness, causality, coin-flip control, no-edge and learnable-edge controls |
 | `test_pabot.py` | pabot.py: offline reads, determinism, vote logic, causality, adapter shape, training-free check |
 | `test_discipline.py` | discipline.py: every gate, abstain-by-default, candidate-vs-signal, no fabricated EV, recent-run gap stop |
+| `test_analyze_discipline.py` | the `discipline` engine adapter: shape, flat-market abstain, candidate-vs-signal, checklist in reasons |
 
 ## P0/P1 — provenance, payout, and the validation harness (2026-11-07)
 
@@ -976,6 +977,22 @@ So this bot makes the process honest and consistent; it does not manufacture an
 edge. Whether it has one is answered by `journal.py --engine discipline`, never
 assumed. `test_discipline.py` pins every gate, the abstain-by-default behaviour,
 the candidate-vs-signal rule, the no-fabricated-EV rule, and the gap stop.
+
+**Wired into every surface (2026-11-08).** The discipline bot is now the
+`discipline` engine everywhere, so the "button" the user presses can be the
+real-trade gate, not just an indicator vote:
+
+- `analysis.analyze_discipline()` — the adapter (`Analysis` shape, `engine="discipline"`).
+- dashboard Engine dropdown → `Discipline (real-trade gate — abstains by default)`;
+  `/api/analyze?engine=discipline` and `/api/scan?engine=discipline` both work.
+- `scan.py --engine discipline`, `alerts.py --engine discipline`,
+  `signal_ask.py --engine discipline`.
+- The dashboard's background journal loop now records `discipline` signals too,
+  so the demo→real record `golive.py` reads includes them.
+
+`test_analyze_discipline.py` pins the adapter: shape, flat-market abstain,
+short-series "not enough", candidate-never-labelled-signal, and the checklist
+being reported in `reasons`.
 
 ## Phase 1 — Data Engine Audit (`data_audit.py`, 2026-11-08)
 

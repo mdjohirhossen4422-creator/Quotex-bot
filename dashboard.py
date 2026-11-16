@@ -24,7 +24,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from analysis import analyze, analyze_smart, analyze_ensemble, analyze_pa
+from analysis import analyze, analyze_smart, analyze_ensemble, analyze_pa, analyze_discipline
 from candle_store import CandleStore, MultiFeed, PERIODS, TIMEFRAMES, asset_catalog
 from journal import Journal, settle_open, summary as journal_summary
 from payout import DEFAULT_PAYOUT
@@ -110,6 +110,7 @@ PAGE = """<!doctype html>
           <option value="smart">Smart (regime + volatility)</option>
           <option value="ensemble">Ensemble (SMC + trend + momentum)</option>
           <option value="pa">Price Action + SMC (no training)</option>
+          <option value="discipline">Discipline (real-trade gate — abstains by default)</option>
         </select>
       </div>
       <button id="go">Analyze</button>
@@ -257,9 +258,9 @@ function renderAnalysis(A){
   v.className='verdict '+(A.action==='CALL'?'call':A.action==='PUT'?'put':'neutral');
   document.getElementById('vbig').textContent=A.action==='NEUTRAL'?'NO TRADE':A.action;
   let sub;
-  if(A.engine==='smart'||A.engine==='pa'){
+  if(A.engine==='smart'||A.engine==='pa'||A.engine==='discipline'){
     sub=A.action!=='NEUTRAL'
-      ? (A.asset+' · '+A.period+'s · '+A.regime+' · confidence '+A.confidence.toFixed(2))
+      ? (A.asset+' · '+A.period+'s · '+(A.regime||'')+' · confidence '+A.confidence.toFixed(2))
       : (A.enough? (A.asset+' · '+A.period+'s · '+A.note) : A.note);
   }else{
     sub=A.enough? (A.asset+' · '+A.period+'s · score '+A.score+' (bull '+A.bull+' / bear '+A.bear+')')
@@ -465,7 +466,7 @@ class Hub:
             try:
                 now = int(time.time())
                 settle_open(self.journal, self.store, now)
-                for engine in ("rule", "ensemble"):
+                for engine in ("rule", "ensemble", "discipline"):
                     rep = scan_all(self.store, self.periods, engine, top=0)
                     for row in rep["signals"]:
                         cs = self.store.load(row["asset"], row["period"], limit=2)
@@ -607,6 +608,7 @@ class Handler(BaseHTTPRequestHandler):
             res = (analyze_smart(asset, period, candles) if engine == "smart"
                    else analyze_ensemble(asset, period, candles) if engine == "ensemble"
                    else analyze_pa(asset, period, candles) if engine == "pa"
+                   else analyze_discipline(asset, period, candles) if engine == "discipline"
                    else analyze(asset, period, candles))
             out = res.__dict__
             if res.enough and candles:

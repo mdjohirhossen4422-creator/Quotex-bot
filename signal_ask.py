@@ -44,7 +44,8 @@ import time
 from pathlib import Path
 
 from alerts import api, load_config, send
-from analysis import analyze, analyze_smart, analyze_ensemble, analyze_pa
+from analysis import (analyze, analyze_smart, analyze_ensemble, analyze_pa,
+                      analyze_discipline)
 from candle_store import CandleStore
 from scan import PERIOD_LABEL, entry_plan, parse_periods
 
@@ -103,7 +104,7 @@ def parse_signal_args(arg: str) -> tuple[str, int | None]:
 
 def _engine_fn(engine: str):
     return {"smart": analyze_smart, "ensemble": analyze_ensemble,
-            "pa": analyze_pa}.get(engine, analyze)
+            "pa": analyze_pa, "discipline": analyze_discipline}.get(engine, analyze)
 
 
 def format_reply(asset: str, period: int, res, plan: dict,
@@ -311,7 +312,7 @@ def main():
     ap.add_argument("--chat", help="only reply to this chat id (else any)")
     ap.add_argument("--db", default="data/candles.db")
     ap.add_argument("--state", default=STATE_PATH)
-    ap.add_argument("--engine", choices=["rule", "smart", "pa", "ensemble"],
+    ap.add_argument("--engine", choices=["rule", "smart", "pa", "ensemble", "discipline"],
                     default="rule")
     ap.add_argument("--period", type=int, default=DEFAULT_PERIOD,
                     help="default timeframe in seconds when none is given")
