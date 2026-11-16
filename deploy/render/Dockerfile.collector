@@ -1,0 +1,30 @@
+# Collector-only image for Render (and any Docker host).
+#
+# The dashboard image (repo Dockerfile) installs the heavy ML stack; the
+# collector needs none of it, so this stays small and builds in seconds.
+FROM python:3.12-slim
+
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# The only third-party deps: a pure-python websocket client and (for SOCKS
+# proxies) python-socks. No compiled extensions, so the image stays tiny.
+RUN pip install --no-cache-dir "websocket-client>=1.6,<2.0" "python-socks[asyncio]>=2.4,<3"
+
+# Collector modules only. candle_store/provenance/tick_summary are imports of
+# live_collector; storage_monitor is the optional disk guard.
+COPY live_collector.py market_qx_candles.py candle_store.py provenance.py \
+     tick_summary.py storage_monitor.py ./
+
+# Durable data goes under /data (mount a Render persistent disk there).
+# Candle-only mode: raw ticks would fill a 1 GB disk in under a day.
+ENV CANDLE_DB=/data/candles.db \
+    COLLECTOR_STATE=/data/collector_state.json \
+    COLLECTOR_STORE_TICKS=0
+
+RUN mkdir -p /data
+VOLUME ["/data"]
+
+CMD ["python", "live_collector.py", "--no-ticks"]

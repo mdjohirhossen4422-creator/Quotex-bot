@@ -1440,3 +1440,30 @@ Fixes added (collector-only, no behaviour change when no proxy is set):
 Deploy-side remedy: set `QX_PROXY` in the Botkeep panel to a proxy whose exit IP
 is in a region where the site loads, then restart. Verify with
 `python live_collector.py --proxy "$QX_PROXY" --minutes 0.5 --pairs EURUSD_otc`.
+
+### Render deploy for the collector (2026-11-08)
+
+`deploy/render/` ships a collector-only Docker image + a Render Blueprint so the
+collector can run on a **US region** instead of the EU (Warsaw) egress that
+Cloudflare blocks on Botkeep.
+
+- `Dockerfile.collector` — only the 6 collector modules + `websocket-client` and
+  `python-socks`. No ML stack (the dashboard image's deps are not needed).
+- `render.yaml` — a **background worker** (`type: worker`) with a 1 GB disk at
+  `/data`, `region: oregon`, candle-only (`COLLECTOR_STORE_TICKS=0`). Point the
+  Render Blueprint Path at `deploy/render/render.yaml` to use it.
+- `COLLECTOR_RENDER.md` — step-by-step (Blueprint and manual) + honest cost.
+
+Key facts (verified 2026-11 against Render docs):
+
+- **No free background worker.** Free tier is web services only, and a Free web
+  service **spins down after 15 min idle** — which drops the websocket feed. A
+  worker starts at **$7/mo** (0.5 CPU / 512 MB) + **$0.25/mo** for a 1 GB disk.
+- Regions: oregon / ohio / virginia / frankfurt / singapore. **Use a US region.**
+  This project's Google Cloud US host (AS396982, Iowa) connects to the feed
+  fine, so a US datacenter IP is not blocked; the EU one is.
+- `dockerContext: .` with `dockerfilePath: deploy/render/Dockerfile.collector`
+  is valid (COPY paths are repo-root relative). Verified by
+  `test_deploy_render.py` and a local `docker build`.
+
+The image was built and run locally: `conn=True`, live prices received, 180 MB.
