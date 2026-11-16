@@ -208,6 +208,26 @@ def test_negative_control_dedup_does_not_overdrop():
         print("PASS test_negative_control_dedup_does_not_overdrop")
 
 
+def test_embedding_stop_from_another_thread():
+    """Embedding contract: run() must not crash off the main thread and a
+    host app must be able to stop() it. No network is used — _connect is
+    stubbed so the loop just idles and observes the stop flag."""
+    import threading
+    import time
+    with tempfile.TemporaryDirectory() as d:
+        db = os.path.join(d, "e.db")
+        c = LiveCollector(db, ["EURUSD_otc"], db + ".state.json", log_every=999)
+        c._connect = lambda assets: False          # never touch the network
+        c.max_backoff = 0.05
+        t = threading.Thread(target=c.run, kwargs={"minutes": 0}, daemon=True)
+        t.start()                                  # run() on a NON-main thread
+        time.sleep(0.3)
+        c.stop()                                   # host-app shutdown request
+        t.join(timeout=10)
+        assert not t.is_alive(), "run() did not stop after stop()"
+        print("PASS test_embedding_stop_from_another_thread")
+
+
 if __name__ == "__main__":
     test_replayed_tick_dropped_but_real_tick_kept()
     test_dedup_survives_restart_reseed()
@@ -218,4 +238,5 @@ if __name__ == "__main__":
     test_schema_is_extended_additively_only()
     test_store_ticks_false_writes_candles_not_ticks()
     test_negative_control_dedup_does_not_overdrop()
+    test_embedding_stop_from_another_thread()
     print("\nall live-collector tests passed")

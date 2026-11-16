@@ -392,9 +392,22 @@ class LiveCollector:
         return [r[0] for r in self.conn.execute(
             "SELECT DISTINCT asset FROM candles ORDER BY asset").fetchall()]
 
+    def stop(self):
+        """Ask the run loop to shut down cleanly from another thread.
+
+        Safe to call from any thread (including a host app / Android service);
+        `run()` performs the graceful flush when it observes the flag.
+        """
+        self._stop.set()
+
     def run(self, minutes: float = 0.0):
-        signal.signal(signal.SIGINT, lambda *_: self._stop.set())
-        signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
+        # signal.signal() only works on the main thread; when embedded in a host
+        # app (Android service, web worker) it must be skipped, not crash.
+        try:
+            signal.signal(signal.SIGINT, lambda *_: self._stop.set())
+            signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
+        except (ValueError, AttributeError):
+            pass
 
         self._flusher = threading.Thread(target=self._flush_loop, daemon=True)
         self._flusher.start()

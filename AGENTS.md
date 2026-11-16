@@ -1410,3 +1410,33 @@ command works with no panel change. `python live_collector.py --no-ticks` and
 `start.sh` path fix: in the ZIP it sits at the root, so ROOT is now
 `$(dirname "$0")`, not `$(dirname "$0")/../..`. Verified with a stub python that
 a crash restarts (backoff) and a clean exit stops the loop.
+
+### Cloudflare 403 on the feed from some hosts (2026-11-08)
+
+Deploying the collector to Botkeep worked (deps installed, `trader.py` ran), but
+the feed handshake failed in a loop:
+
+    feed error: WebSocketBadStatusException("Handshake status 403 Forbidden ...")
+
+The response carried `server: cloudflare`, a `__cf_bm` cookie, and a `cf-ray`
+ending in the colo code (`-WAW` = Warsaw). That is a **Cloudflare geo/bot block on
+the server's egress IP**, not a code bug: the identical client connects fine from
+this US environment and from an allowed region. Note the website's own page also
+returns 403 from a plain request — the block is at the edge.
+
+Fixes added (collector-only, no behaviour change when no proxy is set):
+
+- `market_qx_candles.MarketQX(proxy=...)` / `QX_PROXY` env: route the feed
+  through `http://`, `https://`, `socks5://`, or `socks4://` (with optional
+  `user:pass@`). `_proxy_opts()` parses it into websocket-client kwargs.
+- `live_collector.py --proxy` (or `QX_PROXY`) forwards it to `MarketQX`.
+- `requirements.txt`/`requirements-collector.txt` add `python-socks[asyncio]`
+  (needed only for SOCKS; HTTP CONNECT works with websocket-client alone).
+- `botkeep_preflight.check_feed()` now does a **real WebSocket handshake** with
+  the client's browser headers, not a bare TCP connect (TCP succeeded while the
+  handshake 403'd, so the old check false-PASSed). On 403 it prints the
+  actionable hint: set `QX_PROXY` to an allowed-region proxy.
+
+Deploy-side remedy: set `QX_PROXY` in the Botkeep panel to a proxy whose exit IP
+is in a region where the site loads, then restart. Verify with
+`python live_collector.py --proxy "$QX_PROXY" --minutes 0.5 --pairs EURUSD_otc`.
