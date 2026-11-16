@@ -1490,3 +1490,47 @@ stream. `alerts.py` pushes; `signal_ask.py` answers on request.
 
 Honest limit unchanged: every engine measures ~50% on this feed (see the
 evaluation sections above). The bot shows the indicator read; it is not an edge.
+
+### Real (non-OTC) market shows tick-level structure that OTC lacks (2026-11-08)
+
+Prompted by the user's point that Quotex also carries real-market pairs. Re-ran
+the tick test separately on **non-OTC** vs `_otc` symbols while the real FX
+market was **open** (Monday 04:00 UTC).
+
+Movement (35s of live ticks): real EURUSD/GBPUSD/XAUUSD all MOVED (6–73
+distinct prices), so the weekend-frozen result earlier was only because the
+market was closed — the feed does carry real prices when it is open.
+
+Tick-return sign autocorrelation (lag-1), fresh live ticks:
+
+| pair | kind | n moves | r | z | verdict |
+| --- | --- | --- | --- | --- | --- |
+| XAUUSD | real | 585 | +0.194 | **+4.68** | structure |
+| XAUUSD | real | 273 | +0.282 | **+4.64** | structure |
+| EURUSD | real | 42 | −0.079 | −0.51 | random |
+| GBPUSD | real | 18 | −0.549 | −2.27 | (too few) |
+| EURUSD_otc | otc | — | ≈0 | ≈0 | random |
+
+XAUUSD conditional: P(next up | up) = 56.5%, P(next dn | dn) = 62.9%. This is a
+**genuine, reproducible microstructure effect in the real market** — exactly
+what theory predicts, and precisely what the `_otc` synthetic feed does NOT
+have (its pooled lag-1 autocorrelation is ~0; see the randomwalk section).
+
+**Be honest about the limits** before celebrating:
+
+- It is **tick-level**, not candle-level. The project's engines read *closed
+  candles*; a tick effect can vanish once aggregated.
+- It is **pair-specific** (XAUUSD clearly; EURUSD showed nothing) and this is
+  only a **3-minute** sample during a quiet session.
+- Likely a **move-in-progress / burst** effect: consecutive same-direction ticks
+  during a fast move. That is real but may be smaller than the spread, i.e. not
+  tradeable net of cost.
+- It does **not** rescue the OTC pairs, which are what most of the stored data
+  is.
+
+**This is the first genuinely promising lead in the project** and the correct
+next step is the one already documented elsewhere: collect **real-market
+(non-OTC) data for days while the market is open**, then run `research.py` /
+`validation.py` restricted to `--kind real`, at a few timeframes. Only a
+payout-adjusted, out-of-sample hit-rate above breakeven would make it tradeable.
+Do not tune on 3 minutes.
