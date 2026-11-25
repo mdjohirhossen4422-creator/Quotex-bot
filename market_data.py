@@ -127,8 +127,8 @@ PAIRS: dict[str, tuple[str, str]] = {
 # open == close, which fabricates a fake 80% "edge" (a model that predicts the
 # next day's direction from the current bar's wick). Hourly bars do not have
 # that defect, so the daily series is built by aggregating hourly bars instead
-# of trusting the native daily ones. `aggregate=None` means use the bars as-is.
-TIMEFRAME_PLAN: dict[str, tuple[str, str, int | None]] = {TIMEFRAME_PLAN: dict[str, tuple[str, str, int | None]] = {
+# of trusting the native daily ones. `aggregate=None` means use the bars as-is.s
+TIMEFRAME_PLAN: dict[str, tuple[str, str, int | None]] = {
     "1m": ("1m", "7d", None),
     "5m": ("5m", "60d", None),
     "15m": ("15m", "60d", None),
@@ -137,10 +137,9 @@ TIMEFRAME_PLAN: dict[str, tuple[str, str, int | None]] = {TIMEFRAME_PLAN: dict[s
     "1d": ("1h", "730d", 86400),
     "1wk": ("1wk", "10y", None),
 }
+
 ML_TIMEFRAMES = {k: (v[0], v[1]) for k, v in TIMEFRAME_PLAN.items()}
 ALL_TF = "all"
-
-
 def catalog() -> list[dict]:
     """Grouped instrument list for the UI dropdown."""
     groups: dict[str, list[str]] = {}
