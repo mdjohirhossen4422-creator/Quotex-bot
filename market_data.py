@@ -128,7 +128,8 @@ PAIRS: dict[str, tuple[str, str]] = {
 # next day's direction from the current bar's wick). Hourly bars do not have
 # that defect, so the daily series is built by aggregating hourly bars instead
 # of trusting the native daily ones. `aggregate=None` means use the bars as-is.
-TIMEFRAME_PLAN: dict[str, tuple[str, str, int | None]] = {
+TIMEFRAME_PLAN: dict[str, tuple[str, str, int | None]] = {TIMEFRAME_PLAN: dict[str, tuple[str, str, int | None]] = {
+    "1m": ("1m", "7d", None),
     "5m": ("5m", "60d", None),
     "15m": ("15m", "60d", None),
     "30m": ("30m", "60d", None),
