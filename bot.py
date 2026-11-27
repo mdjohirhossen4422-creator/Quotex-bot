@@ -1,279 +1,413 @@
-import json
-from pathlib import Path
-from threading import Lock
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
+import time
+import threading
+import requests
+from datetime import datetime
+from flask import Flask, jsonify, render_template_string
 
-PORT = int(os.environ.get("PORT", "10000"))
-DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-FILE = DATA_DIR / "results.json"
+app = Flask(__name__)
 
-lock = Lock()
-results = []
-wins = 0
-losses = 0
-pending = None
+PORT = int(os.getenv("PORT", "10000"))
+API_KEY = os.getenv("BDT_API_KEY", "").strip()
 
+BASE_URL = "https://bangladeshitrader.com/chart"
+PAIR_URL = BASE_URL + "/api/pairs"
+CANDLE_URL = BASE_URL + "/Qx.php"
 
-def load_data():
-    global results, wins, losses, pending
-    try:
-        d = json.loads(FILE.read_text(encoding="utf-8"))
-        if isinstance(d, dict):
-            results = [int(x) for x in d.get("results", [])
-                       if str(x).isdigit() and 0 <= int(x) <= 9][-5000:]
-            wins = int(d.get("wins", 0))
-            losses = int(d.get("losses", 0))
-            pending = d.get("pending")
-    except (OSError, ValueError, TypeError):
-        results, wins, losses, pending = [], 0, 0, None
+TIMEFRAME = "M1"
+CANDLE_COUNT = 100
+SCAN_INTERVAL = 3
 
-
-def save_data():
-    FILE.write_text(json.dumps({
-        "results": results,
-        "wins": wins,
-        "losses": losses,
-        "pending": pending
-    }), encoding="utf-8")
+lock = threading.Lock()
+state = {
+    "status": "Starting",
+    "last_update": "",
+    "pairs": [],
+    "signals": [],
+    "error": ""
+}
 
 
-def side(n):
-    return "BIG" if n >= 5 else "SMALL"
+def api_get(url, params=None):
+    if not API_KEY:
+        raise Exception("BDT_API_KEY environment variable missing")
+
+    params = params or {}
+    params["key"] = API_KEY
+
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    return response.json()
 
 
-def frequency(data):
-    if not data:
-        return 50, 50
-    b = sum(x >= 5 for x in data)
-    s = len(data) - b
-    return b * 100 / len(data), s * 100 / len(data)
+def get_pairs():
+    result = api_get(PAIR_URL)
 
-
-def markov(data):
-    if len(data) < 3:
-        return 50, 50
-    last = side(data[-1])
-    b = s = total = 0
-    for i in range(len(data) - 1):
-        if side(data[i]) == last:
-            total += 1
-            if side(data[i + 1]) == "BIG":
-                b += 1
-            else:
-                s += 1
-    return (b + 1) * 100 / (total + 2), (s + 1) * 100 / (total + 2)
-
-
-def trend(data):
-    recent = data[-5:]
-    if not recent:
-        return "WAIT"
-    b = sum(x >= 5 for x in recent)
-    s = len(recent) - b
-    if b > s:
-        return "BIG TREND"
-    if s > b:
-        return "SMALL TREND"
-    return "NEUTRAL"
-
-
-def backtest(data):
-    tested = correct = 0
-    for i in range(5, len(data)):
-        bp, sp = frequency(data[max(0, i - 20):i])
-        if bp == sp:
-            continue
-        prediction = "BIG" if bp > sp else "SMALL"
-        tested += 1
-        if prediction == side(data[i]):
-            correct += 1
-    accuracy = round(correct * 100 / tested, 1) if tested else 0
-    return {"tested": tested, "correct": correct, "accuracy": accuracy}
-
-
-def analyze():
-    if len(results) < 5:
-        return {
-            "signal": "WAIT",
-            "confidence": 0,
-            "reason": "Need 5 results"
-        }
-
-    bp, sp = frequency(results[-20:])
-    mb, ms = markov(results)
-    t = trend(results)
-
-    big_score = bp * 0.55 + mb * 0.45
-    small_score = sp * 0.55 + ms * 0.45
-
-    if t == "BIG TREND":
-        big_score += 3
-    elif t == "SMALL TREND":
-        small_score += 3
-
-    total = big_score + small_score
-    big_score = big_score * 100 / total
-    small_score = 100 - big_score
-
-    if big_score > small_score:
-        signal = "BIG"
-        confidence = big_score
+    if isinstance(result, list):
+        items = result
+    elif isinstance(result, dict):
+        items = (
+            result.get("data")
+            or result.get("pairs")
+            or result.get("result")
+            or []
+        )
     else:
-        signal = "SMALL"
-        confidence = small_score
+        items = []
 
-    if confidence < 55:
+    pairs = []
+
+    for item in items:
+        if isinstance(item, str):
+            name = item
+            broker = "quotex"
+            opened = True
+        elif isinstance(item, dict):
+            name = (
+                item.get("display")
+                or item.get("pair")
+                or item.get("symbol")
+                or item.get("name")
+            )
+            broker = str(item.get("broker", "quotex")).lower()
+            opened = item.get("open", item.get("active", True))
+        else:
+            continue
+
+        if not name:
+            continue
+
+        if "_otc" not in str(name).lower():
+            continue
+
+        if "quotex" not in broker:
+            continue
+
+        if opened is False:
+            continue
+
+        pairs.append(str(name))
+
+    return list(dict.fromkeys(pairs))
+
+
+def get_candles(pair):
+    result = api_get(
+        CANDLE_URL,
+        {
+            "pair": pair,
+            "timeframe": TIMEFRAME,
+            "count": CANDLE_COUNT
+        }
+    )
+
+    if not isinstance(result, dict) or not result.get("success", True):
+        return []
+
+    candles = result.get("data", [])
+
+    if not isinstance(candles, list):
+        return []
+
+    cleaned = []
+
+    for candle in candles:
+        try:
+            cleaned.append({
+                "open": float(candle["open"]),
+                "high": float(candle["high"]),
+                "low": float(candle["low"]),
+                "close": float(candle["close"])
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    return cleaned
+
+
+def ema(values, period):
+    if len(values) < period:
+        return None
+
+    multiplier = 2 / (period + 1)
+    value = sum(values[:period]) / period
+
+    for price in values[period:]:
+        value = (price - value) * multiplier + value
+
+    return value
+
+
+def rsi(values, period=14):
+    if len(values) <= period:
+        return 50
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+
+    if avg_loss == 0:
+        return 100
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def analyze(pair, candles):
+    if len(candles) < 30:
+        return None
+
+    closes = [c["close"] for c in candles]
+
+    fast = ema(closes, 9)
+    slow = ema(closes, 21)
+    strength = rsi(closes)
+
+    if fast is None or slow is None:
+        return None
+
+    score = 0
+    reasons = []
+
+    if fast > slow:
+        score += 1
+        reasons.append("EMA bullish")
+    elif fast < slow:
+        score -= 1
+        reasons.append("EMA bearish")
+
+    if strength >= 55 and strength < 75:
+        score += 1
+        reasons.append("RSI bullish")
+    elif strength <= 45 and strength > 25:
+        score -= 1
+        reasons.append("RSI bearish")
+
+    previous = candles[-2]
+    latest = candles[-1]
+
+    if latest["close"] > latest["open"]:
+        score += 1
+        reasons.append("Bullish candle")
+    elif latest["close"] < latest["open"]:
+        score -= 1
+        reasons.append("Bearish candle")
+
+    if score >= 2:
+        signal = "UP"
+    elif score <= -2:
+        signal = "DOWN"
+    else:
         signal = "WAIT"
 
+    confidence = min(95, 50 + abs(score) * 12)
+
+    if signal == "WAIT":
+        confidence = 50
+
     return {
+        "pair": pair,
+        "timeframe": TIMEFRAME,
         "signal": signal,
-        "confidence": round(confidence, 1),
-        "big_percent": round(bp, 1),
-        "small_percent": round(sp, 1),
-        "markov_big": round(mb, 1),
-        "markov_small": round(ms, 1),
-        "trend": t,
-        "pattern": "".join("B" if x >= 5 else "S" for x in results[-5:]),
-        "backtest": backtest(results),
-        "reason": "Frequency + Trend + Markov analysis"
+        "confidence": confidence,
+        "rsi": round(strength, 2),
+        "ema9": round(fast, 6),
+        "ema21": round(slow, 6),
+        "price": latest["close"],
+        "reasons": reasons,
+        "updated": datetime.now().strftime("%H:%M:%S")
     }
 
 
-def get_state():
-    a = analyze()
-    recent = results[-20:]
-    return {
-        **a,
-        "count": len(results),
-        "big": sum(x >= 5 for x in recent),
-        "small": sum(x < 5 for x in recent),
-        "wins": wins,
-        "losses": losses,
-        "checked": wins + losses,
-        "history": results[-30:]
-    }
+def scanner():
+    while True:
+        try:
+            with lock:
+                state["status"] = "Scanning"
+                state["error"] = ""
+
+            pairs = get_pairs()
+            results = []
+
+            for pair in pairs:
+                try:
+                    candles = get_candles(pair)
+                    result = analyze(pair, candles)
+
+                    if result:
+                        results.append(result)
+
+                except Exception as exc:
+                    print("Pair error:", pair, str(exc))
+
+                time.sleep(SCAN_INTERVAL)
+
+            results.sort(
+                key=lambda x: x["confidence"],
+                reverse=True
+            )
+
+            with lock:
+                state["pairs"] = pairs
+                state["signals"] = results
+                state["last_update"] = datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                state["status"] = "Active"
+
+            print(
+                "Scan complete:",
+                len(pairs),
+                "pairs;",
+                len(results),
+                "signals"
+            )
+
+        except Exception as exc:
+            with lock:
+                state["status"] = "API Error"
+                state["error"] = str(exc)
+
+            print("Scanner error:", str(exc))
+
+        time.sleep(10)
 
 
-HTML = r"""<!DOCTYPE html>
+HTML = """
+<!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ADVANCED WINGO AI</title>
+<title>QUOTEX OTC LIVE SCANNER</title>
 <style>
 *{box-sizing:border-box}
-body{margin:0;padding:15px;background:#080d19;color:white;font-family:Arial}
-.main{max-width:650px;margin:auto}
-h2{text-align:center;color:#30e5b0}
-.card{background:#142036;border:1px solid #293b57;border-radius:14px;padding:17px;margin:13px 0}
-.center{text-align:center}
-.signal{font-size:40px;font-weight:bold;margin:15px}
-.green{color:#2ee5a5}.red{color:#ff637b}.yellow{color:#ffd166}
-input{width:100%;padding:15px;font-size:23px;text-align:center;background:#091426;color:white;border:1px solid #425b7a;border-radius:9px}
-button{width:100%;padding:15px;margin-top:10px;border:0;border-radius:9px;background:#17c99a;color:#001b15;font-weight:bold;font-size:17px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.stat{background:#0b1629;padding:13px;border-radius:9px;text-align:center}
-.stat b{display:block;font-size:23px;margin-top:7px}
-.bar{height:12px;background:#293a52;border-radius:20px;overflow:hidden}
-.fill{height:100%;background:#20d7a0}
-.history{display:flex;flex-wrap:wrap;gap:7px}
-.num{background:#293a52;padding:9px 12px;border-radius:7px}
-.muted{color:#a9bad0;font-size:13px}
+body{margin:0;background:#101522;color:#fff;font-family:Arial;padding:15px}
+h2{color:#32d9a0}
+.card{background:#1c2638;padding:15px;border-radius:12px;margin:12px 0}
+.stat{display:flex;justify-content:space-between;gap:10px}
+.green{color:#32d9a0}
+.red{color:#ff647c}
+.yellow{color:#ffd166}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{padding:10px 5px;border-bottom:1px solid #39445a;text-align:left}
+button{background:#32d9a0;border:0;padding:10px 15px;border-radius:7px;font-weight:bold}
+.small{color:#aab6ca;font-size:12px}
 </style>
 </head>
 <body>
-<div class="main">
-<h2>⚡ ADVANCED AI WINGO BOT</h2>
+<h2>QUOTEX OTC LIVE SCANNER</h2>
 
-<div class="card center">
-<div class="muted">NEXT PERIOD SIGNAL</div>
-<div id="signal" class="signal yellow">WAIT</div>
-<div>Confidence: <b id="confidence">0%</b></div>
-<div class="bar"><div id="fill" class="fill" style="width:0%"></div></div>
-<p class="muted" id="reason">Add 5 results to start analysis.</p>
+<div class="card">
+<div class="stat">
+<b>Status</b>
+<b id="status">Loading...</b>
+</div>
+<p class="small">Last update: <span id="updated">--</span></p>
+<div class="stat">
+<span>OTC Pairs</span>
+<b id="pairs">0</b>
+</div>
+<div class="stat">
+<span>Analyzed</span>
+<b id="analyzed">0</b>
+</div>
 </div>
 
 <div class="card">
-<b>ADD LAST RESULT (0–9)</b>
+<h3>M1 LIVE SIGNALS</h3>
+<p class="small">UP / DOWN / WAIT</p>
+<table>
+<thead>
+<tr>
+<th>PAIR</th>
+<th>SIGNAL</th>
+<th>CONF.</th>
+<th>RSI</th>
+</tr>
+</thead>
+<tbody id="signals">
+<tr><td colspan="4">Waiting for data...</td></tr>
+</tbody>
+</table>
+</div>
 
-</html>"""
+<div class="card">
+<b>API Information</b>
+<p class="small" id="error">No error</p>
+<p class="small">Signals are statistical estimates, not guaranteed predictions.</p>
+</div>
+
+<button onclick="loadData()">Refresh Now</button>
+
+<script>
+async function loadData(){
+ try{
+  const response=await fetch('/api/state');
+  const data=await response.json();
+
+  document.getElementById('status').textContent=data.status;
+  document.getElementById('updated').textContent=data.last_update||'--';
+  document.getElementById('pairs').textContent=data.pairs.length;
+  document.getElementById('analyzed').textContent=data.signals.length;
+  document.getElementById('error').textContent=data.error||'No error';
+
+  const tbody=document.getElementById('signals');
+  tbody.innerHTML='';
+
+  if(!data.signals.length){
+   tbody.innerHTML='<tr><td colspan="4">No signals yet</td></tr>';
+  }
+
+  data.signals.forEach(item=>{
+   const tr=document.createElement('tr');
+   const color=item.signal==='UP'?'green':
+               item.signal==='DOWN'?'red':'yellow';
+
+   [item.pair,item.signal,item.confidence+'%',item.rsi].forEach((value,index)=>{
+    const td=document.createElement('td');
+    td.textContent=value;
+    if(index===1)td.className=color;
+    tr.appendChild(td);
+   });
+
+   tbody.appendChild(tr);
+  });
+ }catch(e){
+  document.getElementById('error').textContent=e.message;
+ }
+}
+
+loadData();
+setInterval(loadData,5000);
+</script>
+</body>
+</html>
+"""
 
 
-class Handler(BaseHTTPRequestHandler):
-    def send_data(self, code, data, content_type="application/json; charset=utf-8"):
-        body = data.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+@app.route("/")
+def home():
+    return render_template_string(HTML)
 
-    def do_GET(self):
-        if self.path == "/":
-            self.send_data(200, HTML, "text/html; charset=utf-8")
-        elif self.path == "/health":
-            self.send_data(200, json.dumps({"status": "ok"}))
-        elif self.path == "/api/state":
-            with lock:
-                data = get_state()
-            self.send_data(200, json.dumps(data))
-        else:
-            self.send_data(404, json.dumps({"error": "Not found"}))
 
-    def do_POST(self):
-        global pending, wins, losses
+@app.route("/api/state")
+def api_state():
+    with lock:
+        return jsonify(state)
 
-        if self.path != "/api/add":
-            self.send_data(404, json.dumps({"error": "Not found"}))
-            return
 
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length < 1 or length > 10000:
-                raise ValueError("Invalid request")
-
-            payload = json.loads(self.rfile.read(length))
-            digit = payload.get("digit")
-
-            if isinstance(digit, bool) or not isinstance(digit, int) or not 0 <= digit <= 9:
-                raise ValueError("Enter a digit from 0 to 9")
-
-            with lock:
-                if pending and pending.get("signal") in ("BIG", "SMALL"):
-                    actual = side(digit)
-                    if pending["signal"] == actual:
-                        wins += 1
-                    else:
-                        losses += 1
-
-                results.append(digit)
-                del results[:-5000]
-
-                signal_data = analyze()
-                pending = {
-                    "signal": signal_data["signal"],
-                    "confidence": signal_data["confidence"]
-                }
-
-                save_data()
-                data = get_state()
-
-            self.send_data(200, json.dumps(data))
-
-        except (ValueError, TypeError, json.JSONDecodeError) as e:
-            self.send_data(400, json.dumps({"error": str(e)}))
-        except OSError as e:
-            print("Save error:", e, flush=True)
-            self.send_data(500, json.dumps({"error": "Could not save data"}))
-
-    def log_message(self, fmt, *args):
-        print(fmt % args, flush=True)
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
 
 
 if __name__ == "__main__":
-    load_data()
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print("ADVANCED AI WINGO BOT ACTIVE", flush=True)
-    print("Listening on port:", PORT, flush=True)
-    server.serve_forever(
+    threading.Thread(target=scanner, daemon=True).start()
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
