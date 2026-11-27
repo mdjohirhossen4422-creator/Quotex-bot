@@ -1,685 +1,514 @@
-!/usr/bin/env python3
-"""Live web dashboard for the market-qx signal bot (multi-pair, multi-timeframe).
+#!/usr/bin/env python3
+"""Quotex / market-qx OTC M1 Live Scanner Dashboard."""
 
-The user picks a pair and a timeframe, then presses Analyze. The bot computes
-the indicator set on the stored candles for that exact (pair, timeframe) and
-returns an explainable CALL / PUT / NEUTRAL verdict.
-
-A single websocket connection streams every pair on every timeframe; closed
-candles are persisted to SQLite (candle_store.py) so history accumulates across
-restarts. Stdlib only — no Flask/etc.
-
-Usage
------
-    .venv/bin/python dashboard.py --port 12000
-    .venv/bin/python dashboard.py --assets EURUSD_otc,BTCUSD_otc --port 12000
-"""
 from __future__ import annotations
 
-import argparse
-import json
 import os
-import threading
+import json
 import time
+import threading
+import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from analysis import (analyze, analyze_smart, analyze_ensemble,
-                      analyze_pa, analyze_discipline)
-from candle_store import CandleStore, MultiFeed, PERIODS, TIMEFRAMES, asset_catalog
-from journal import Journal, settle_open, summary as journal_summary
-from payout import DEFAULT_PAYOUT
+from candle_store import CandleStore, MultiFeed, asset_catalog
+from scan import scan_all
 
-PAGE = """<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>QX Quant · AI Signal Terminal</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+
+PERIOD = 60
+SCAN_INTERVAL = 15
+
+
+PAGE = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quotex OTC M1 Scanner</title>
 <style>
-  :root{
-    --bg:#05070c; --bg2:#080b12; --panel:rgba(20,26,38,.72); --panel2:#0d1220;
-    --line:rgba(120,140,180,.14); --line2:rgba(120,140,180,.24);
-    --txt:#eaf0f8; --mut:#8794ab; --mut2:#5d6a80;
-    --up:#16e0a0; --up-dim:rgba(22,224,160,.14);
-    --down:#ff5c72; --down-dim:rgba(255,92,114,.14);
-    --acc:#5b8cff; --acc2:#8b6cff; --gold:#f5c451;
-    --glow:0 0 0 1px rgba(120,140,180,.12), 0 18px 60px -20px rgba(0,0,0,.9);
-    --radius:18px;
-  }
-  *{box-sizing:border-box}
-  html,body{height:100%}
-  body{
-    margin:0;color:var(--txt);font:14.5px/1.5 Inter,-apple-system,Segoe UI,Roboto,sans-serif;
-    background:
-      radial-gradient(1100px 620px at 12% -8%, rgba(91,140,255,.16), transparent 60%),
-      radial-gradient(1000px 560px at 100% 0%, rgba(139,108,255,.14), transparent 55%),
-      radial-gradient(900px 700px at 60% 120%, rgba(22,224,160,.07), transparent 60%),
-      linear-gradient(180deg,var(--bg),var(--bg2));
-    background-attachment:fixed;min-height:100vh;
-  }
-  a{color:var(--acc)}
-  .mono{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace}
+*{box-sizing:border-box}
+body{
+ margin:0;background:#080d17;color:#eaf1ff;
+ font-family:Arial,sans-serif;padding:15px
+}
+.wrap{max-width:1000px;margin:auto}
+header{
+ background:#111c30;padding:18px;border-radius:14px;
+ border:1px solid #263653;margin-bottom:15px
+}
+h2{margin:0 0 8px;color:#65a5ff}
+.status{font-size:13px;color:#9eacc5}
+.card{
+ background:#111c30;border:1px solid #263653;
+ border-radius:14px;padding:16px;margin-bottom:15px
+}
+button,select{
+ width:100%;padding:14px;border-radius:9px;
+ border:1px solid #344967;background:#182741;
+ color:white;font-size:15px;margin-top:8px
+}
+button{font-weight:bold;cursor:pointer}
+.start{background:#087c58;border:0}
+.stop{background:#b52e45;border:0}
+.signal{
+ text-align:center;padding:25px 10px;
+ background:#0b1424;border-radius:12px;margin-top:15px
+}
+.signal h1{font-size:42px;margin:10px 0}
+.call{color:#16e0a0}
+.put{color:#ff6478}
+.neutral{color:#f5c451}
+.grid{
+ display:grid;grid-template-columns:1fr 1fr;gap:10px
+}
+.stat{
+ background:#0b1424;border-radius:10px;padding:14px;
+ overflow-wrap:anywhere
+}
+.stat small{color:#91a2bd}
+.stat b{display:block;font-size:18px;margin-top:7px}
+#chart{
+ width:100%;height:230px;background:#0b1424;
+ border-radius:10px;margin-top:12px
+}
+.item{
+ padding:12px 4px;border-bottom:1px solid #263653;
+ display:flex;justify-content:space-between;gap:10px
+}
+.muted{color:#91a2bd;font-size:12px}
+.green{color:#16e0a0}
+.red{color:#ff6478}
+@media(max-width:550px){
+ .grid{grid-template-columns:1fr 1fr}
+ .signal h1{font-size:34px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
 
-  /* ---------- top bar ---------- */
-  header.top{
-    position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:16px;flex-wrap:wrap;
-    padding:14px 26px;background:rgba(6,9,15,.72);backdrop-filter:blur(18px) saturate(160%);
-    border-bottom:1px solid var(--line);
-  }
-  .brand{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:.2px}
-  .logo{
-    width:38px;height:38px;border-radius:12px;display:grid;place-items:center;font-size:19px;
-    background:linear-gradient(135deg,var(--acc),var(--acc2));
-    box-shadow:0 10px 30px -8px rgba(91,140,255,.7), inset 0 1px 0 rgba(255,255,255,.35);
-  }
-  .brand small{display:block;font-weight:500;font-size:11px;color:var(--mut);letter-spacing:.14em;text-transform:uppercase}
-  .pill{
-    display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:999px;
-    background:rgba(255,255,255,.03);border:1px solid var(--line);font-size:12px;color:var(--mut);
-  }
-  .dot{width:8px;height:8px;border-radius:50%;background:var(--mut2)}
-  .dot.on{background:var(--up);box-shadow:0 0 10px var(--up)}
-  .spacer{margin-left:auto}
-  .hstat{text-align:right}
-  .hstat b{display:block;font-size:15px;font-variant-numeric:tabular-nums}
-  .hstat span{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--mut2)}
-
-  /* ---------- layout ---------- */
-  .shell{max-width:1560px;margin:0 auto;padding:22px 26px 60px;
-         display:grid;grid-template-columns:minmax(0,1fr) 400px;gap:20px}
-  @media(max-width:1120px){.shell{grid-template-columns:1fr}}
-  .col{display:flex;flex-direction:column;gap:20px;min-width:0}
-  .card{
-    background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
-    box-shadow:var(--glow);backdrop-filter:blur(14px);overflow:hidden;
-  }
-  .card .hd{display:flex;align-items:center;gap:10px;padding:15px 18px;border-bottom:1px solid var(--line)}
-  .card .hd h3{margin:0;font-size:12px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--mut)}
-  .card .hd .tag{margin-left:auto;font-size:11px;color:var(--mut2)}
-  .card .bd{padding:18px}
-
-  /* ---------- controls ---------- */
-  .controls{display:grid;grid-template-columns:1.3fr 1.1fr .9fr;gap:14px}
-  @media(max-width:760px){.controls{grid-template-columns:1fr}}
-  label.fld{display:block}
-  label.fld>span{display:block;font-size:10.5px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--mut2);margin:0 0 7px 3px}
-  select,button{width:100%;font-family:inherit}
-  select{
-    appearance:none;padding:12px 40px 12px 14px;border-radius:12px;border:1px solid var(--line2);
-    background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.01));
-    color:var(--txt);font-size:14px;cursor:pointer;transition:.15s;
-    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2 4l4 4 4-4' fill='none' stroke='%238794ab' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E");
-    background-repeat:no-repeat;background-position:right 14px center;
-  }
-  select:hover{border-color:var(--acc)}
-  select:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 4px rgba(91,140,255,.16)}
-  option{background:#0b1018;color:var(--txt)}
-  .cta{
-    margin-top:16px;display:flex;gap:12px;flex-wrap:wrap;align-items:center;
-  }
-  button.primary{
-    flex:1;min-width:220px;padding:15px 22px;border:none;border-radius:13px;cursor:pointer;
-    font-weight:800;font-size:15px;letter-spacing:.02em;color:#04070d;
-    background:linear-gradient(135deg,#7fb0ff,#5b8cff 45%,#8b6cff);
-    box-shadow:0 16px 40px -14px rgba(91,140,255,.85), inset 0 1px 0 rgba(255,255,255,.5);
-    transition:.15s;position:relative;overflow:hidden;
-  }
-  button.primary:hover{transform:translateY(-1px);box-shadow:0 22px 50px -14px rgba(91,140,255,.95)}
-  button.primary:active{transform:translateY(0)}
-  button.primary:disabled{opacity:.55;cursor:default;transform:none}
-  button.ghost{
-    padding:14px 18px;border-radius:13px;cursor:pointer;font-weight:700;font-size:13.5px;
-    background:rgba(255,255,255,.03);border:1px solid var(--line2);color:var(--txt);transition:.15s;
-  }
-  button.ghost:hover{border-color:var(--acc);color:#fff}
-  .hint{margin-top:12px;font-size:12.5px;color:var(--mut)}
-  .chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
-  .chip{padding:6px 11px;border-radius:999px;font-size:11.5px;color:var(--mut);
-        background:rgba(255,255,255,.03);border:1px solid var(--line)}
-  .chip b{color:var(--txt);font-weight:600}
-
-  /* ---------- signal hero ---------- */
-  .hero{padding:22px;border-radius:var(--radius);position:relative;overflow:hidden;
-        border:1px solid var(--line);background:linear-gradient(180deg,rgba(20,26,38,.85),rgba(12,16,26,.85))}
-  .hero.up{box-shadow:inset 0 0 0 1px rgba(22,224,160,.35), 0 30px 80px -40px rgba(22,224,160,.6)}
-  .hero.down{box-shadow:inset 0 0 0 1px rgba(255,92,114,.35), 0 30px 80px -40px rgba(255,92,114,.6)}
-  .hero .row1{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
-  .verdictBig{font-size:52px;font-weight:800;line-height:1;letter-spacing:-.02em}
-  .hero.up .verdictBig{color:var(--up);text-shadow:0 0 34px rgba(22,224,160,.5)}
-  .hero.down .verdictBig{color:var(--down);text-shadow:0 0 34px rgba(255,92,114,.5)}
-  .hero.idle .verdictBig{color:var(--mut)}
-  .arrow{font-size:34px;filter:drop-shadow(0 0 16px currentColor)}
-  .hero.up .arrow{color:var(--up)} .hero.down .arrow{color:var(--down)} .hero.idle .arrow{color:var(--mut2)}
-  .heroMeta{margin-left:auto;text-align:right}
-  .heroMeta .pair{font-weight:700;font-size:16px}
-  .heroMeta .tf{font-size:12px;color:var(--mut)}
-  .conf{margin-top:18px}
-  .conf .lbl{display:flex;justify-content:space-between;font-size:11px;color:var(--mut);margin-bottom:6px;letter-spacing:.08em;text-transform:uppercase}
-  .track{height:12px;border-radius:999px;background:rgba(255,255,255,.05);overflow:hidden;position:relative}
-  .track i{display:block;height:100%;border-radius:999px;transition:width .5s cubic-bezier(.2,.8,.2,1)}
-  .hero.up .track i{background:linear-gradient(90deg,#0e8f6a,var(--up))}
-  .hero.down .track i{background:linear-gradient(90deg,#a2303f,var(--down))}
-  .hero.idle .track i{background:var(--mut2)}
-  .hero .verdict-line{margin-top:14px;font-size:13px;color:var(--mut)}
-  .badge{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:8px;font-size:11px;font-weight:700;letter-spacing:.04em}
-  .badge.edge{background:var(--up-dim);color:var(--up);border:1px solid rgba(22,224,160,.3)}
-  .badge.noedge{background:rgba(245,196,81,.12);color:var(--gold);border:1px solid rgba(245,196,81,.3)}
-  .badge.bad{background:var(--down-dim);color:var(--down);border:1px solid rgba(255,92,114,.3)}
-
-  /* ---------- metrics ---------- */
-  .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:6px}
-  @media(max-width:760px){.metrics{grid-template-columns:1fr 1fr}}
-  .metric{background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:14px;padding:13px 14px}
-  .metric span{display:block;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--mut2);margin-bottom:5px}
-  .metric b{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums}
-  .metric small{display:block;color:var(--mut);font-size:11.5px;margin-top:3px}
-
-  /* ---------- progress ---------- */
-  .prog{margin-top:16px}
-  .prog .bar{height:8px;border-radius:999px;background:rgba(255,255,255,.06);overflow:hidden}
-  .prog .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2));width:0;transition:width .4s;border-radius:999px}
-  .prog .txt{margin-top:9px;font-size:12.5px;color:var(--mut);display:flex;align-items:center;gap:9px}
-  .spin{width:14px;height:14px;border-radius:50%;border:2px solid rgba(255,255,255,.18);border-top-color:var(--acc);animation:sp .7s linear infinite;display:none}
-  .prog.busy .spin{display:inline-block}
-  @keyframes sp{to{transform:rotate(360deg)}}
-
-  /* ---------- chart ---------- */
-  canvas{width:100%;display:block}
-  #chart{height:340px}
-  .chartWrap{position:relative}
-  .chartWrap .ov{position:absolute;top:12px;left:14px;font-size:11px;color:var(--mut);background:rgba(5,7,12,.6);padding:5px 10px;border-radius:8px;border:1px solid var(--line)}
-
-  /* ---------- tables ---------- */
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  td,th{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left}
-  th{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--mut2);font-weight:600}
-  td:last-child,th:last-child{text-align:right}
-  tr:last-child td{border-bottom:none}
-  .k{color:var(--mut)}
-  .imp{height:7px;border-radius:999px;background:linear-gradient(90deg,var(--acc),var(--acc2));display:inline-block;vertical-align:middle}
-  .verdictCell{font-weight:700}
-  .v-edge{color:var(--up)} .v-no{color:var(--gold)} .v-bad{color:var(--down)}
-
-  /* ---------- tf rows (all mode) ---------- */
-  .tfgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-  @media(max-width:760px){.tfgrid{grid-template-columns:1fr}}
-  .tfbox{border:1px solid var(--line);border-radius:14px;padding:13px;background:rgba(255,255,255,.02)}
-  .tfbox .top{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
-  .tfbox .name{font-weight:700}
-  .tfbox .act{font-weight:800;font-size:15px}
-  .tfbox.up .act{color:var(--up)} .tfbox.down .act{color:var(--down)}
-  .tfbox .m{font-size:11.5px;color:var(--mut);font-variant-numeric:tabular-nums}
-
-  /* ---------- scan ---------- */
-  .sig{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;padding:11px 4px;border-bottom:1px solid var(--line)}
-  .sig:last-child{border-bottom:none}
-  .tag{font-weight:800;font-size:11px;padding:4px 9px;border-radius:8px;letter-spacing:.04em}
-  .tag.CALL{background:var(--up-dim);color:var(--up)}
-  .tag.PUT{background:var(--down-dim);color:var(--down)}
-  .tag.NEUTRAL{background:rgba(255,255,255,.05);color:var(--mut)}
-  .sig .m{font-variant-numeric:tabular-nums;color:var(--mut)}
-  .sig .why{color:var(--mut2);font-size:11.5px;margin-top:3px}
-  .scroll{max-height:440px;overflow:auto}
-  .empty{padding:22px;text-align:center;color:var(--mut2);font-size:13px}
-  .skeleton{height:12px;border-radius:6px;background:linear-gradient(90deg,rgba(255,255,255,.04),rgba(255,255,255,.09),rgba(255,255,255,.04));background-size:200% 100%;animation:sh 1.3s infinite}
-  @keyframes sh{to{background-position:-200% 0}}
-  footer{padding:26px;text-align:center;color:var(--mut2);font-size:12px}
-  .fineprint{color:var(--mut2);font-size:11.5px;line-height:1.6}
-</style></head><body>
-<header class="top">
-  <div class="brand">
-    <div class="logo">◆</div>
-    <div>QX Quant<small>AI Signal Terminal</small></div>
-  </div>
-  <span class="pill"><span class="dot" id="dot"></span><span id="feedState">connecting…</span></span>
-  <span class="pill">pairs <b class="mono" id="nPairs" style="color:var(--txt)">–</b></span>
-  <span class="spacer"></span>
-  <div class="hstat"><b class="mono" id="hPrice">–</b><span>live price</span></div>
-  <div class="hstat"><b class="mono" id="hTps">–</b><span>ticks / s</span></div>
-  <div class="hstat"><b class="mono" id="hStored">–</b><span>candles</span></div>
+<header>
+ <h2>◆ QUOTEX OTC SCANNER</h2>
+ <div class="status" id="status">Connecting to live market...</div>
 </header>
 
-<div class="shell">
-  <!-- ============ LEFT ============ -->
-  <div class="col">
-    <div class="card">
-      <div class="hd"><h3>Market selection</h3><span class="tag" id="srcTag">Yahoo Finance · historical</span></div>
-      <div class="bd">
-        <div class="controls">
-          <label class="fld"><span>Market / pair</span><select id="pair"></select></label>
-          <label class="fld"><span>Timeframe</span><select id="tf"></select></label>
-          <label class="fld"><span>Live chart pair</span><select id="livePair"></select></label>
-        </div>
-        <div class="cta">
-          <button class="primary" id="go">⚡ Get Analysis</button>
-          <button class="ghost" id="retrain" title="Ignore the cache and retrain">↻ Retrain</button>
-        </div>
-        <div class="prog" id="prog">
-          <div class="bar"><i id="progBar"></i></div>
-          <div class="txt"><span class="spin"></span><span id="progTxt">pick a market and press Get Analysis</span></div>
-        </div>
-      </div>
-    </div>
+<div class="card">
+ <h3>Live Scanner Control</h3>
+ <label>OTC Market Pair</label>
+ <select id="pair"></select>
 
-    <div class="card">
-      <div class="hd"><h3>Live signal engine</h3><span class="tag">real-trade gate</span></div>
-      <div class="bd">
-        <div class="controls">
-          <label class="fld"><span>Pair</span><select id="lsPair"></select></label>
-          <label class="fld"><span>Timeframe</span><select id="lsTf"></select></label>
-          <label class="fld"><span>Engine</span>
-            <select id="lsEngine">
-              <option value="discipline" selected>Discipline (abstains by default)</option>
-              <option value="rule">Rule (indicator votes)</option>
-              <option value="smart">Smart (regime + volatility)</option>
-              <option value="ensemble">Ensemble (SMC + trend + momentum)</option>
-              <option value="pa">Price Action + SMC</option>
-            </select>
-          </label>
-        </div>
-        <div class="cta">
-          <button class="primary" id="lsGo">Analyze (live feed)</button>
-        </div>
-        <div class="hero idle" id="lsHero" style="margin-top:14px">
-          <div class="row1">
-            <span class="arrow" id="lsArrow">◆</span>
-            <div class="verdictBig" id="lsBig">NO TRADE</div>
-            <div class="heroMeta"><div class="pair" id="lsSub">pick a pair</div></div>
-          </div>
-          <div class="verdict-line" id="lsLine">Discipline is the default engine: it returns NO TRADE unless every gate passes. Use this for anything near real money.</div>
-        </div>
-        <div class="fineprint" id="lsWhy" style="margin-top:10px"></div>
-      </div>
-    </div>
+ <button id="toggle" class="start" onclick="toggleScan()">
+ ▶ START M1 LIVE SCAN
+ </button>
 
-    <div class="card">
-      <div class="hd"><h3>ML signal</h3><span class="tag" id="mlAsOf"></span></div>
-      <div class="bd">
-        <div class="hero idle" id="hero">
-          <div class="row1">
-            <span class="arrow" id="arrow">◆</span>
-            <div class="verdictBig" id="verdictBig">NO SIGNAL</div>
-            <div class="heroMeta">
-              <div class="pair" id="heroPair">—</div>
-              <div class="tf" id="heroTf">choose a market</div>
-            </div>
-          </div>
-          <div class="conf">
-            <div class="lbl"><span>Model confidence</span><span id="confPct">—</span></div>
-            <div class="track"><i id="confBar" style="width:0%"></i></div>
-          </div>
-          <div class="verdict-line" id="heroLine">The model trains on freshly downloaded history, then predicts the next candle's direction.</div>
-        </div>
-
-        <div class="metrics" id="metrics" style="margin-top:16px"></div>
-        <div id="tfBreakdown"></div>
-        <div id="signalHint" class="fineprint" style="margin-top:14px"></div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="hd"><h3>Price action</h3><span class="tag" id="chartTag">live feed</span></div>
-      <div class="bd chartWrap" style="padding:0">
-        <div class="ov" id="chartOv">live market-qx candles</div>
-        <canvas id="chart"></canvas>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="hd"><h3>Scan all pairs</h3>
-        <span class="tag"><select id="scanTf" style="width:auto;padding:5px 26px 5px 8px;font-size:11.5px;border-radius:8px">
-          <option value="5">5s</option><option value="15">15s</option><option value="60">1m</option>
-          <option value="5,15,60">5s+15s+1m</option><option value="all">all</option>
-        </select></span>
-      </div>
-      <div class="bd">
-        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-          <button class="ghost" id="scanGo" style="width:auto;flex:0 0 auto">Scan now</button>
-          <span class="hint" id="scanHint" style="margin:0">runs the rule engine over every stored pair</span>
-        </div>
-        <div class="scroll" id="scanList" style="margin-top:12px"></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ============ RIGHT ============ -->
-  <div class="col">
-    <div class="card">
-      <div class="hd"><h3>Model diagnostics</h3><span class="tag" id="diagTag">walk-forward</span></div>
-      <div class="bd">
-        <table id="diag"><tbody><tr><td class="k">status</td><td>waiting for a run</td></tr></tbody></table>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="hd"><h3>Feature importance</h3><span class="tag">permutation</span></div>
-      <div class="bd"><div id="impList" class="fineprint">run an analysis to see which features the model leans on</div></div>
-    </div>
-
-    <div class="card">
-      <div class="hd"><h3>Data quality</h3><span class="tag">cleaning report</span></div>
-      <div class="bd"><div id="quality" class="fineprint">no data downloaded yet</div></div>
-    </div>
-
-    <div class="card">
-      <div class="hd"><h3>Demo → Real money gate</h3></div>
-      <div class="bd">
-        <div class="hero idle" id="glBanner" style="padding:16px">
-          <div class="verdictBig" id="glStage" style="font-size:26px">—</div>
-          <div class="verdict-line" id="glSub" style="margin-top:8px">checking…</div>
-        </div>
-        <div id="glChecks" class="fineprint" style="margin-top:12px"></div>
-        <div id="glPaper" class="fineprint" style="margin-top:10px"></div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="hd"><h3>Track record</h3><span class="tag">settled signals</span></div>
-      <div class="bd">
-        <div class="metrics" id="jStats" style="grid-template-columns:1fr 1fr"></div>
-        <div id="jVerdict" class="fineprint" style="margin-top:12px"></div>
-        <div id="jPairs" style="margin-top:8px"></div>
-      </div>
-    </div>
-  </div>
+ <p class="muted">
+ Timeframe: 1 Minute | Automatic scan: Every 15 seconds
+ </p>
 </div>
 
-<footer>
-  QX Quant · market-qx live feed + Yahoo Finance history · signals are research alerts, not financial advice.
-</footer>
+<div class="card">
+ <h3>Live Signal</h3>
+ <div class="signal">
+  <div class="muted" id="signalPair">Waiting for scan</div>
+  <h1 id="signal">WAIT</h1>
+  <div id="reason" class="muted">Start scanner to analyze market</div>
+ </div>
+</div>
+
+<div class="card">
+ <h3>Market Information</h3>
+ <div class="grid">
+  <div class="stat"><small>Live Price</small><b id="price">—</b></div>
+  <div class="stat"><small>Timeframe</small><b>1 MIN</b></div>
+  <div class="stat"><small>Stored Candles</small><b id="count">0</b></div>
+  <div class="stat"><small>Last Update</small><b id="updated">—</b></div>
+ </div>
+</div>
+
+<div class="card">
+ <h3>Live Candle Chart</h3>
+ <canvas id="chart"></canvas>
+ <div class="muted">Market-qx candle data</div>
+</div>
+
+<div class="card">
+ <h3>Scanner Results</h3>
+ <div id="results" class="muted">No scan results yet</div>
+</div>
+
+<div class="card">
+ <h3>Scanner Information</h3>
+ <div class="muted" id="info">
+ Scanner stopped
+ </div>
+</div>
+
+</div>
 
 <script>
-let catalog=[], tfList=[], cur={pair:null,tf:null}, live={asset:null}, polling=false, autoScan=0, scanning=false, lastBundle=null;
+let running=false;
+let scanTimer=null;
+let stateTimer=null;
+let candles=[];
+let pairs=[];
 
-function fmt(t){return new Date(t*1000).toLocaleTimeString();}
-function clock(ts){return new Date(ts*1000).toLocaleTimeString();}
-function cd(secs){if(secs==null)return '—';if(secs<=0)return 'now';if(secs<60)return 'in '+secs+'s';return 'in '+Math.floor(secs/60)+'m'+String(secs%60).padStart(2,'0')+'s';}
-function pct(x){return (x*100).toFixed(1)+'%';}
+const $=id=>document.getElementById(id);
 
-async function boot(){
-  const r=await fetch('/api/ml_catalog'); const j=await r.json();
-  catalog=j.groups||[]; tfList=j.timeframes||[];
-  const ps=document.getElementById('pair');
-  catalog.forEach(g=>{
-    const og=document.createElement('optgroup'); og.label=g.type.toUpperCase();
-    g.symbols.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;og.appendChild(o);});
-    ps.appendChild(og);
+async function request(url){
+ const r=await fetch(url,{cache:"no-store"});
+ if(!r.ok)throw new Error("HTTP "+r.status);
+ return await r.json();
+}
+
+async function loadPairs(){
+ try{
+  const j=await request("/api/catalog");
+  pairs=j.pairs||[];
+  $("pair").innerHTML="";
+
+  pairs.forEach(p=>{
+   const o=document.createElement("option");
+   o.value=p;
+   o.textContent=p;
+   $("pair").appendChild(o);
   });
-  const tfs=document.getElementById('tf');
-  tfList.forEach(t=>{const o=document.createElement('option');o.value=t.value;o.textContent=t.label;tfs.appendChild(o);});
-  tfs.value='1h';
-  ps.value=catalog.length&&catalog[0].symbols.includes('EURUSD')?'EURUSD':(catalog[0]?catalog[0].symbols[0]:'');
-  document.getElementById('go').onclick=()=>analyze(false);
-  document.getElementById('retrain').onclick=()=>analyze(true);
-  document.getElementById('scanGo').onclick=scanAll;
-  document.getElementById('lsGo').onclick=analyzeLive;
-  loadLivePairs();
-  tick();
-  scanAll();
-}
 
-async function analyzeLive(){
-  const a=document.getElementById('lsPair').value;
-  const p=document.getElementById('lsTf').value;
-  const eng=document.getElementById('lsEngine').value;
-  if(!a)return;
-  const btn=document.getElementById('lsGo'); btn.disabled=true;
-  document.getElementById('lsLine').textContent='reading the live feed…';
-  try{
-    const r=await fetch('/api/analyze?asset='+encodeURIComponent(a)+'&period='+p+'&engine='+eng);
-    const A=await r.json();
-    const act=A.action||'NEUTRAL';
-    const up=act==='CALL', down=act==='PUT';
-    document.getElementById('lsHero').className='hero '+(up?'up':down?'down':'idle');
-    document.getElementById('lsArrow').textContent=up?'▲':down?'▼':'◆';
-    document.getElementById('lsBig').textContent=act==='NEUTRAL'?'NO TRADE':act;
-    document.getElementById('lsSub').textContent=A.asset+' · '+A.period+'s · '+eng;
-    let line;
-    if(act==='NEUTRAL'){line=A.note||'no trade';}
-    else{line='confidence '+((A.confidence!=null)?A.confidence.toFixed(2):'—')+(A.regime?(' · '+A.regime):'');}
-    document.getElementById('lsLine').textContent=line;
-    document.getElementById('lsWhy').innerHTML=(A.reasons||[]).map(x=>'• '+x).join('<br>')||'';
-  }catch(e){
-    document.getElementById('lsLine').textContent='request failed — is the live feed connected?';
-  }finally{btn.disabled=false;}
-}
-
-async function loadLivePairs(){
-  const sel=document.getElementById('livePair');
-  const lsP=document.getElementById('lsPair');
-  const lsT=document.getElementById('lsTf');
-  lsT.innerHTML='';
-  for(const t of tfList){const o=document.createElement('option');o.value=t.value;o.textContent=t.label;lsT.appendChild(o);}
-  lsT.value='60';
-  for(let attempt=0;attempt<40;attempt++){
-    try{
-      const r=await fetch('/api/catalog'); const j=await r.json();
-      if(j.loading||!(j.groups||[]).length){
-        document.getElementById('nPairs').textContent='…';
-        document.getElementById('feedState').textContent='loading instruments…';
-        await sleep(2000); continue;
-      }
-      let n=0;
-      (j.groups||[]).forEach(g=>g.symbols.forEach(s=>{n++;
-        const o=document.createElement('option');o.value=s;o.textContent=s;sel.appendChild(o);
-        const o2=document.createElement('option');o2.value=s;o2.textContent=s;lsP.appendChild(o2);}));
-      document.getElementById('nPairs').textContent=n;
-      sel.value=j.default_asset||sel.options[0]?.value;
-      lsP.value=j.default_asset||lsP.options[0]?.value;
-      live.asset=sel.value;
-      sel.onchange=()=>{live.asset=sel.value;drawLive();};
-      document.getElementById('feedState').textContent='live feed online';
-      document.getElementById('dot').className='dot on';
-      return;
-    }catch(e){await sleep(2000);}
+  if(j.loading){
+   $("status").textContent="Loading market instruments...";
+   setTimeout(loadPairs,2000);
+   return;
   }
-  document.getElementById('feedState').textContent='feed offline';
-}
 
-function setProgress(busy,text,p){
-  const prog=document.getElementById('prog');
-  prog.className='prog'+(busy?' busy':'');
-  document.getElementById('progTxt').textContent=text;
-  document.getElementById('progBar').style.width=(p*100)+'%';
-}
-
-async function analyze(force){
-  const pair=document.getElementById('pair').value;
-  const tf=document.getElementById('tf').value;
-  if(!pair)return;
-  cur={pair,tf};
-  document.getElementById('go').disabled=true;
-  document.getElementById('retrain').disabled=true;
-  document.getElementById('heroPair').textContent=pair+' · '+tf;
-  setProgress(true,'starting…',0.02);
-  try{
-    const r=await fetch('/api/ml_train?pair='+encodeURIComponent(pair)+'&tf='+encodeURIComponent(tf)+(force?'&force=1':''));
-    const j=await r.json();
-    if(j.error){setProgress(false,'error: '+j.error,0);document.getElementById('heroLine').textContent=j.error;return;}
-    pollJob(j.job_id);
-  }catch(e){
-    setProgress(false,'request failed — retrying is safe',0);
-  }finally{
-    document.getElementById('retrain').disabled=false;
+  $("status").textContent="Live feed connected · "+pairs.length+" pairs";
+  if(!pairs.length){
+   $("status").textContent="No OTC pairs discovered";
   }
+ }catch(e){
+  $("status").textContent="Feed connection pending: "+e.message;
+  setTimeout(loadPairs,3000);
+ }
 }
 
-async function pollJob(id){
-  polling=true;
-  while(polling){
-    let s;
-    try{const r=await fetch('/api/ml_job?id='+id);s=await r.json();}catch(e){await sleep(1200);continue;}
-    setProgress(true,s.step||'training…',s.progress||0);
-    if(s.state==='done'){polling=false;document.getElementById('go').disabled=false;setProgress(false,'done · '+s.step,1);render(s.result);break;}
-    if(s.state==='error'){polling=false;document.getElementById('go').disabled=false;setProgress(false,'error',0);document.getElementById('heroLine').textContent=s.error||'training failed';break;}
-    await sleep(900);
+async function toggleScan(){
+ if(running){
+  stopScan();
+ }else{
+  startScan();
+ }
+}
+
+function startScan(){
+ if(!pairs.length){
+  $("info").textContent="Waiting for OTC market instruments...";
+  loadPairs();
+  return;
+ }
+
+ running=true;
+ $("toggle").textContent="■ STOP LIVE SCAN";
+ $("toggle").className="stop";
+ $("info").textContent="M1 scanner is running";
+ scanNow();
+ scanTimer=setInterval(scanNow,15000);
+ stateTimer=setInterval(loadState,1800);
+}
+
+function stopScan(){
+ running=false;
+ clearInterval(scanTimer);
+ clearInterval(stateTimer);
+ $("toggle").textContent="▶ START M1 LIVE SCAN";
+ $("toggle").className="start";
+ $("info").textContent="Scanner stopped";
+}
+
+async function scanNow(){
+ if(!running)return;
+
+ $("info").textContent="Scanning all OTC pairs...";
+ try{
+  const j=await request("/api/scan");
+  const list=j.results||j.signals||[];
+
+  $("results").innerHTML="";
+
+  if(!list.length){
+   $("results").textContent=
+    "No signals yet. Waiting for enough closed M1 candles.";
+   return;
   }
-}
-function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
 
-function render(B){
-  if(!B)return;
-  lastBundle=B;
-  const s=B.signal||{};
-  const up=s.action==='UP', down=s.action==='DOWN';
-  const hero=document.getElementById('hero');
-  hero.className='hero '+(up?'up':down?'down':'idle');
-  document.getElementById('arrow').textContent=up?'▲':down?'▼':'◆';
-  document.getElementById('verdictBig').textContent=s.action||'NO SIGNAL';
-  document.getElementById('heroPair').textContent=B.pair+' · '+(B.tf==='all'?('all · '+B.tfs.join('/')):B.tf);
-  document.getElementById('heroTf').textContent=B.symbol||'';
-  const conf=s.confidence||0;
-  document.getElementById('confPct').textContent=pct(conf);
-  document.getElementById('confBar').style.width=Math.max(3,Math.min(100,conf*100))+'%';
-  document.getElementById('mlAsOf').textContent='trained '+B.trained_on;
-  const v=B.verdict||'';
-  const vc=v.includes('EDGE DETECTED')?'edge':(v.includes('BELOW')?'bad':'noedge');
-  document.getElementById('heroLine').innerHTML=
-    'Next-candle call <b>'+(s.action||'—')+'</b> at '+pct(conf)+' confidence · '+
-    '<span class="badge '+vc+'">'+v+'</span>'+
-    (s.agree?(' · agreement '+s.agree):'');
+  list.forEach(x=>{
+   const action=String(x.action||x.signal||"NEUTRAL").toUpperCase();
+   const cls=action==="CALL"||action==="UP"?"green":
+             action==="PUT"||action==="DOWN"?"red":"muted";
 
-  renderMetrics(B);
-  renderBreakdown(B);
-  renderDiagnostics(B);
-  renderImportance(B);
-  renderQuality(B);
-  drawBundleChart(B);
-  document.getElementById('signalHint').innerHTML=
-    'Honest note: this feed behaves close to a random walk. A confidence near 50% and a '+
-    'walk-forward edge near zero is the expected, truthful result — the badge above reports it. '+
-    'Never treat a signal as a guaranteed trade.';
+   const div=document.createElement("div");
+   div.className="item";
+
+   const left=document.createElement("div");
+   const name=document.createElement("b");
+   name.textContent=x.asset||x.pair||"Unknown";
+   const detail=document.createElement("div");
+   detail.className="muted";
+   detail.textContent=x.note||x.reason||"M1 analysis";
+   left.append(name,detail);
+
+   const right=document.createElement("b");
+   right.className=cls;
+   right.textContent=action;
+
+   div.append(left,right);
+   $("results").appendChild(div);
+  });
+
+  $("info").textContent="Last scan: "+new Date().toLocaleTimeString();
+ }catch(e){
+  $("info").textContent="Scan error: "+e.message;
+ }
 }
 
-function renderMetrics(B){
-  const v=B.validation||{};
-  const q=B.quality||{};
-  const items=[
-    ['Accuracy', v.mean_acc!=null?pct(v.mean_acc):'—', 'walk-forward out-of-sample'],
-    ['Baseline', v.mean_baseline!=null?pct(v.mean_baseline):'—', 'majority-class guess'],
-    ['Edge', v.mean_edge!=null?((v.mean_edge>=0?'+':'')+pct(v.mean_edge)):'—', 'accuracy − baseline'],
-    ['AUC', v.mean_auc!=null?v.mean_auc.toFixed(3):'—', 'ranking quality (0.5 = coin)'],
-    ['Samples', (B.samples||0).toLocaleString(), (B.features||0)+' features'],
-    ['Bars', (B.bars||0).toLocaleString(), 'history length'],
-    ['Quality', q.score!=null?q.score.toFixed(2):'—', q.ok?'passed cleaning':'failed cleaning'],
-    ['Up-rate', B.up_rate!=null?pct(B.up_rate):'—', 'label balance'],
-  ];
-  document.getElementById('metrics').innerHTML=items.map(([k,val,sub])=>
-            import ml_engine
-            st = ml_engine.job_status(jid)
-            if st is None:
-                return self._json({"error": "unknown job"}, 404)
-            return self._json(st)
-        if u.path == "/api/scan":
-            q = parse_qs(u.query)
-            spec = (q.get("periods") or ["5"])[0]
-            engine = (q.get("engine") or ["rule"])[0]
-            try:
-                top = int((q.get("top") or ["60"])[0])
-            except ValueError:
-                top = 60
-            gate = (q.get("gate") or ["0"])[0] in ("1", "true", "yes", "on")
-            try:
-                gth = float((q.get("gate_threshold") or ["0.55"])[0])
-            except ValueError:
-                gth = 0.55
-            from scan import parse_periods, scan_all
-            rep = scan_all(self.hub.store, parse_periods(spec), engine, top=top,
-                           gate=gate, gate_threshold=gth)
-            return self._json(rep)
-        if u.path == "/api/golive":
-            q = parse_qs(u.query)
-            try:
-                payout = float((q.get("payout") or ["0.85"])[0])
-            except ValueError:
-                payout = 0.85
-            try:
-                min_n = int((q.get("min_n") or ["300"])[0])
-            except ValueError:
-                min_n = 300
-            if self.hub.journal is None:
-                return self._json({"stage": "disabled", "checks": [], "paper": {}})
-            from golive import gate
-            return self._json(gate(self.hub.journal, payout, min_n))
-        if u.path == "/api/journal":
-            q = parse_qs(u.query)
-            asset = (q.get("asset") or [""])[0]
-            engine = (q.get("engine") or ["rule"])[0]
-            try:
-                payout = float((q.get("payout") or ["0.85"])[0])
-            except ValueError:
-                payout = 0.85
-            if self.hub.journal is None:
-                return self._json({"logged": 0, "settled": 0, "open": 0,
-                                   "verdict": "disabled", "pairs": []})
-            return self._json(journal_summary(self.hub.journal, asset, engine, payout))
+async function loadState(){
+ const asset=$("pair").value;
+ if(!asset)return;
+
+ try{
+  const j=await request(
+   "/api/state?asset="+encodeURIComponent(asset)+"&period=60"
+  );
+
+  const c=j.candles||[];
+  candles=c;
+  $("count").textContent=c.length;
+
+  if(c.length){
+   const last=c[c.length-1];
+   $("price").textContent=Number(last[4]).toFixed(6);
+   $("updated").textContent=new Date().toLocaleTimeString();
+   drawChart();
+  }
+ }catch(e){
+  $("status").textContent="State error: "+e.message;
+ }
+}
+
+function drawChart(){
+ const canvas=$("chart");
+ const ctx=canvas.getContext("2d");
+ const w=canvas.clientWidth;
+ const h=230;
+ const dpr=window.devicePixelRatio||1;
+
+ canvas.width=w*dpr;
+ canvas.height=h*dpr;
+ ctx.scale(dpr,dpr);
+ ctx.clearRect(0,0,w,h);
+
+ if(!candles.length)return;
+
+ const data=candles.slice(-45);
+ const highs=data.map(x=>Number(x[3]));
+ const lows=data.map(x=>Number(x[2]));
+ const max=Math.max(...highs);
+ const min=Math.min(...lows);
+ const range=max-min||1;
+ const top=15,bottom=15;
+ const usable=h-top-bottom;
+ const step=w/data.length;
+ const body=Math.max(3,step*.48);
+
+ data.forEach((c,i)=>{
+  const o=Number(c[1]),cl=Number(c[4]);
+  const hi=Number(c[3]),lo=Number(c[2]);
+  const x=i*step+step/2;
+  const y=v=>top+(max-v)/range*usable;
+  const up=cl>=o;
+
+  ctx.strokeStyle=up?"#16e0a0":"#ff6478";
+  ctx.fillStyle=ctx.strokeStyle;
+  ctx.beginPath();
+  ctx.moveTo(x,y(hi));
+  ctx.lineTo(x,y(lo));
+  ctx.stroke();
+
+  const by=Math.min(y(o),y(cl));
+  const bh=Math.max(2,Math.abs(y(o)-y(cl)));
+  ctx.fillRect(x-body/2,by,body,bh);
+ });
+}
+
+$("pair").addEventListener("change",()=>{
+ if(running)loadState();
+});
+
+loadPairs();
+setInterval(()=>{
+ if(!running)loadPairs();
+},10000);
+</script>
+</body>
+</html>
+"""
+
+
+class Hub:
+    def __init__(self, assets, store):
+        self.store = store
+        self.assets = assets
+        self.feed = None
+        self.feed_thread = None
+        self.lock = threading.RLock()
+        self.error = ""
+
+        self.start_feed()
+
+    def start_feed(self):
+        try:
+            self.feed = MultiFeed(
+                self.assets,
+                [PERIOD],
+                self.store
+            )
+
+            start = getattr(self.feed, "start", None)
+
+            if callable(start):
+                start()
+            else:
+                run = getattr(self.feed, "run", None)
+                if callable(run):
+                    self.feed_thread = threading.Thread(
+                        target=run,
+                        daemon=True
+                    )
+                    self.feed_thread.start()
+                else:
+                    self.error = "MultiFeed has no start/run method"
+
+        except Exception as exc:
+            self.error = str(exc)
+            print("FEED ERROR:", exc)
+
+    def get_candles(self, asset):
+        try:
+            if self.feed:
+                data = self.feed.candles(asset, PERIOD)
+                if data:
+                    return data
+        except Exception:
+            pass
+
+        try:
+            return self.store.load(asset, PERIOD, limit=300)
+        except Exception:
+            return []
+
+    def state(self, asset):
+        data = self.get_candles(asset)
+        return {
+            "asset": asset,
+            "period": PERIOD,
+            "candles": data[-300:],
+            "count": len(data),
+            "error": self.error
+        }
+
+    def close(self):
+        try:
+            if self.feed and hasattr(self.feed, "stop"):
+                self.feed.stop()
+        except Exception:
+            pass
+
+
+def discover_otc_assets():
+    catalog = asset_catalog()
+    found = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            symbols = value.get("symbols")
+            if isinstance(symbols, (list, tuple)):
+                for symbol in symbols:
+                    if isinstance(symbol, str):
+                        found.append(symbol)
+
+            for key, child in value.items():
+                if key != "symbols":
+                    walk(child)
+
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                walk(child)
+
+    walk(catalog)
+
+    # Keep only symbols explicitly marked as OTC.
+    result = sorted(set(
+        x for x in found
+        if x.lower().endswith("_otc")
+    ))
+
+    return result
+
+
+class Handler(BaseHTTPRequestHandler):
+    hub = None
+
+    def log_message(self, fmt, *args):
+        print("%s - %s" % (self.address_string(), fmt % args))
+
+    def send_json(self, data, status=200):
+        body = json.dumps(data, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+
         if u.path == "/api/catalog":
-            return self._json(self.hub.catalog())
-        if u.path == "/api/analyze":
-            q = parse_qs(u.query)
-            default = self.hub.assets[0] if self.hub.assets else ""
-            asset = (q.get("asset") or [default])[0]
-            try:
-                period = int((q.get("period") or [self.hub.periods[0]])[0])
-            except ValueError:
-                period = self.hub.periods[0]
-            candles = self.hub.feed.candles(asset, period) if self.hub.feed else []
-            engine = (q.get("engine") or ["rule"])[0]
-            from scan import entry_plan
-            try:
-                expiry = int((q.get("expiry") or ["1"])[0])
-            except ValueError:
-                expiry = 1
-            res = (analyze_smart(asset, period, candles) if engine == "smart"
-                   else analyze_ensemble(asset, period, candles) if engine == "ensemble"
-                   else analyze_pa(asset, period, candles) if engine == "pa"
-                   else analyze_discipline(asset, period, candles) if engine == "discipline"
-                   else analyze(asset, period, candles))
-            out = res.__dict__
-            if res.enough and candles:
-                out.update(entry_plan(period, candles[-1][0], time.time(), expiry))
-            return self._json(out)
-        if u.path == "/api/intel":
-            q = parse_qs(u.query)
-            default = self.hub.assets[0] if self.hub.assets else ""
-            asset = (q.get("asset") or [default])[0]
-            try:
-                period = int((q.get("period") or [self.hub.periods[0]])[0])
-            except ValueError:
-                period = self.hub.periods[0]
-            try:
-                payout = float((q.get("payout") or [str(DEFAULT_PAYOUT)])[0])
-            except ValueError:
-                payout = DEFAULT_PAYOUT
-            candles = self.hub.feed.candles(asset, period) if self.hub.feed else []
-            if not candles:
-                candles = self.hub.store.load(asset, period, limit=400)
-            from intelligence import analyse as intel_analyse
-            from decision import decide
-            from provenance import classify_source
-            intel = intel_analyse(candles, len(candles) - 1, asset, period)
-            if intel is None:
-                return self._json({"asset": asset, "period": period,
-                                   "error": "not enough candles"})
-            out = intel.as_dict()
-            decision = decide(
-                intel.votes, asset=asset, period=period,
-                source=classify_source(asset), now=int(candles[-1][0]),
-                payout=payout,
-                regime_defined=bool(intel.regime.get("defined", True)))
-            out["decision"] = decision.as_dict()
-            return self._json(out)
+            self.send_json({
+                "pairs": self.hub.assets,
+                "loading": not bool(self.hub.assets),
+                "error": self.hub.error
+            })
+            return
+
         if u.path == "/api/state":
-            q = parse_qs(u.query)
-            sa = (q.get("asset") or [None])[0]
+            asset = (q.get("asset") or [
+                self.hub.assets[0] if self.hub.assets else ""
+            ])[0]
+
+            if asset not in self.hub.assets:
+                self.send_json({"error": "Unknown asset"}, 404)
+                return
+
+            self.send_json(self.hub.state(asset))
+            return
+
+        if u.path == "/api/scan":
             try:
-                sp = int((q.get("period") or [0])[0]) or None
-            except ValueError:
-                sp = None
-            return self._json(self.hub.state(sa, sp))
-        body = PAGE.encode()
+                report = scan_all(
+                    self.hub.store,
+                    [PERIOD],
+                    "rule",
+                    top=200
+                )
+                self.send_json(report)
+            except Exception as exc:
+                self.send_json({
+                    "error": str(exc),
+                    "results": []
+                }, 500)
+            return
+
+        body = PAGE.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -689,31 +518,59 @@ function renderMetrics(B){
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Multi-pair signal dashboard")
-    ap.add_argument("--assets", default="", help="comma list; default = all instruments")
-    ap.add_argument("--periods", default="", help="comma list of seconds; default = all")
-    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", 12000)))
-    ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--db", default=os.environ.get("CANDLE_DB", "data/candles.db"))
-    ap.add_argument("--journal", default=os.environ.get("JOURNAL_DB", "data/journal.db"),
-                    help="signal journal database ('' to disable)")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--assets", default="")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("PORT", "10000"))
+    )
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument(
+        "--db",
+        default=os.environ.get("CANDLE_DB", "data/candles.db")
+    )
+
+    args = parser.parse_args()
+
+    os.makedirs(os.path.dirname(args.db) or ".", exist_ok=True)
 
     store = CandleStore(args.db)
-    assets = [a.strip() for a in args.assets.split(",") if a.strip()]
-    periods = [int(p) for p in args.periods.split(",") if p.strip()] or PERIODS
 
-    journal = Journal(args.journal) if args.journal else None
-    hub = Hub(assets, periods, store, journal=journal)
+    assets = [
+        x.strip()
+        for x in args.assets.split(",")
+        if x.strip()
+    ]
+
+    if not assets:
+        assets = discover_otc_assets()
+
+    if not assets:
+        print("WARNING: No OTC instruments discovered.")
+
+    hub = Hub(assets, store)
     Handler.hub = hub
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"dashboard: http://{args.host}:{args.port}  "
-          f"({'all' if not assets else len(assets)} pairs x {len(periods)} timeframes)")
+
+    server = ThreadingHTTPServer(
+        (args.host, args.port),
+        Handler
+    )
+
+    print("QUOTEX OTC M1 SCANNER STARTED")
+    print("Port:", args.port)
+    print("OTC pairs:", len(assets))
+    print("Timeframe: 60 seconds")
+
     try:
-        srv.serve_forever()
+        server.serve_forever()
     except KeyboardInterrupt:
-        srv.shutdown()
+        pass
+    finally:
+        hub.close()
+        server.server_close()
 
 
 if __name__ == "__main__":
-    main(
+    main()
