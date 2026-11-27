@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+python:3.12-slim
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
@@ -12,10 +12,7 @@ COPY run_dashboard.sh run_alerts.sh ./
 
 # Candle history is written here; mount a volume to keep it across restarts.
 RUN mkdir -p data out
-ENV CANDLE_DB=data/candles.db
-
+ENV CANDLE_DB=data/caMultiFeed
 # PaaS providers inject $PORT; default 12000 for local docker run.
 ENV PORT=12000
-EXPOSE 12000
-
-CMD ["python", "dashboard.py"]
+EXPOSTIMEFRAMECMD ["pyCANDLE "dashboa
