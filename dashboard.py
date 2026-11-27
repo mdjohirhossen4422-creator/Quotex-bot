@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""Quotex / market-qx OTC M1 Live Scanner Dashboard."""
-
-from __future__ import annotations
+"""Quotex OTC M1 Live Scanner Dashboard."""
 
 import os
 import json
@@ -11,564 +9,353 @@ import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from candle_store import CandleStore, MultiFeed, asset_catalog
+from candle_store import CandleStore, MultiFeed
 from scan import scan_all
 
 
-PERIOD = 60
+PORT = int(os.environ.get("PORT", "10000"))
+HOST = "0.0.0.0"
+DB_PATH = os.environ.get("CANDLE_DB", "data/candles.db")
 SCAN_INTERVAL = 15
+TIMEFRAME = 60
 
 
 PAGE = r"""
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Quotex OTC M1 Scanner</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quotex OTC Live Scanner</title>
 <style>
-*{box-sizing:border-box}
-body{
- margin:0;background:#080d17;color:#eaf1ff;
- font-family:Arial,sans-serif;padding:15px
+body {
+    background:#101522;color:#fff;
+    font-family:Arial;margin:0;padding:15px;
 }
-.wrap{max-width:1000px;margin:auto}
-header{
- background:#111c30;padding:18px;border-radius:14px;
- border:1px solid #263653;margin-bottom:15px
+.card {
+    background:#1c2638;padding:15px;
+    border-radius:12px;margin-bottom:12px;
 }
-h2{margin:0 0 8px;color:#65a5ff}
-.status{font-size:13px;color:#9eacc5}
-.card{
- background:#111c30;border:1px solid #263653;
- border-radius:14px;padding:16px;margin-bottom:15px
+h2 {color:#36d6a0}
+button,select {
+    padding:13px;border:0;border-radius:8px;
+    font-size:16px;margin:5px;
 }
-button,select{
- width:100%;padding:14px;border-radius:9px;
- border:1px solid #344967;background:#182741;
- color:white;font-size:15px;margin-top:8px
+button {background:#16a879;color:white}
+.stop {background:#d84949}
+.signal {
+    font-size:30px;font-weight:bold;
+    text-align:center;padding:20px;
 }
-button{font-weight:bold;cursor:pointer}
-.start{background:#087c58;border:0}
-.stop{background:#b52e45;border:0}
-.signal{
- text-align:center;padding:25px 10px;
- background:#0b1424;border-radius:12px;margin-top:15px
-}
-.signal h1{font-size:42px;margin:10px 0}
-.call{color:#16e0a0}
-.put{color:#ff6478}
-.neutral{color:#f5c451}
-.grid{
- display:grid;grid-template-columns:1fr 1fr;gap:10px
-}
-.stat{
- background:#0b1424;border-radius:10px;padding:14px;
- overflow-wrap:anywhere
-}
-.stat small{color:#91a2bd}
-.stat b{display:block;font-size:18px;margin-top:7px}
-#chart{
- width:100%;height:230px;background:#0b1424;
- border-radius:10px;margin-top:12px
-}
-.item{
- padding:12px 4px;border-bottom:1px solid #263653;
- display:flex;justify-content:space-between;gap:10px
-}
-.muted{color:#91a2bd;font-size:12px}
-.green{color:#16e0a0}
-.red{color:#ff6478}
-@media(max-width:550px){
- .grid{grid-template-columns:1fr 1fr}
- .signal h1{font-size:34px}
-}
+.call {color:#24df9b}
+.put {color:#ff6565}
+.neutral {color:#ffc857}
+pre {white-space:pre-wrap;overflow-wrap:anywhere}
 </style>
 </head>
 <body>
-<div class="wrap">
-
-<header>
- <h2>◆ QUOTEX OTC SCANNER</h2>
- <div class="status" id="status">Connecting to live market...</div>
-</header>
+<h2>QUOTEX OTC M1 SCANNER</h2>
 
 <div class="card">
- <h3>Live Scanner Control</h3>
- <label>OTC Market Pair</label>
- <select id="pair"></select>
-
- <button id="toggle" class="start" onclick="toggleScan()">
- ▶ START M1 LIVE SCAN
- </button>
-
- <p class="muted">
- Timeframe: 1 Minute | Automatic scan: Every 15 seconds
- </p>
+    <div>Connection: <b id="connection">Checking...</b></div>
+    <div>OTC Pairs: <b id="pairs">0</b></div>
+    <div>Timeframe: <b>1 Minute</b></div>
+    <div>Scan Interval: <b>15 Seconds</b></div>
 </div>
 
 <div class="card">
- <h3>Live Signal</h3>
- <div class="signal">
-  <div class="muted" id="signalPair">Waiting for scan</div>
-  <h1 id="signal">WAIT</h1>
-  <div id="reason" class="muted">Start scanner to analyze market</div>
- </div>
+    <button onclick="start()">START SCANNER</button>
+    <button class="stop" onclick="stop()">STOP SCANNER</button>
 </div>
 
 <div class="card">
- <h3>Market Information</h3>
- <div class="grid">
-  <div class="stat"><small>Live Price</small><b id="price">—</b></div>
-  <div class="stat"><small>Timeframe</small><b>1 MIN</b></div>
-  <div class="stat"><small>Stored Candles</small><b id="count">0</b></div>
-  <div class="stat"><small>Last Update</small><b id="updated">—</b></div>
- </div>
+    <select id="pair"></select>
+    <button onclick="analyze()">ANALYZE</button>
 </div>
 
 <div class="card">
- <h3>Live Candle Chart</h3>
- <canvas id="chart"></canvas>
- <div class="muted">Market-qx candle data</div>
+    <h3>Latest Signal</h3>
+    <div id="signal" class="signal neutral">WAITING</div>
+    <div id="details">Waiting for market data...</div>
 </div>
 
 <div class="card">
- <h3>Scanner Results</h3>
- <div id="results" class="muted">No scan results yet</div>
-</div>
-
-<div class="card">
- <h3>Scanner Information</h3>
- <div class="muted" id="info">
- Scanner stopped
- </div>
-</div>
-
+    <h3>Live Scan Results</h3>
+    <pre id="results">Waiting...</pre>
 </div>
 
 <script>
-let running=false;
-let scanTimer=null;
-let stateTimer=null;
-let candles=[];
-let pairs=[];
+let timer=null;
 
-const $=id=>document.getElementById(id);
-
-async function request(url){
- const r=await fetch(url,{cache:"no-store"});
- if(!r.ok)throw new Error("HTTP "+r.status);
- return await r.json();
+async function api(path) {
+    const r=await fetch(path);
+    return await r.json();
 }
 
-async function loadPairs(){
- try{
-  const j=await request("/api/catalog");
-  pairs=j.pairs||[];
-  $("pair").innerHTML="";
+async function refresh() {
+    try {
+        const s=await api('/api/state');
+        document.getElementById('connection').textContent=
+            s.running ? 'RUNNING' : 'STOPPED';
+        document.getElementById('pairs').textContent=s.pairs.length;
 
-  pairs.forEach(p=>{
-   const o=document.createElement("option");
-   o.value=p;
-   o.textContent=p;
-   $("pair").appendChild(o);
-  });
+        const select=document.getElementById('pair');
+        const old=select.value;
+        if(select.options.length!==s.pairs.length) {
+            select.innerHTML='';
+            s.pairs.forEach(p=>{
+                const o=document.createElement('option');
+                o.value=p;o.textContent=p;select.appendChild(o);
+            });
+            if(s.pairs.includes(old)) select.value=old;
+        }
 
-  if(j.loading){
-   $("status").textContent="Loading market instruments...";
-   setTimeout(loadPairs,2000);
-   return;
-  }
-
-  $("status").textContent="Live feed connected · "+pairs.length+" pairs";
-  if(!pairs.length){
-   $("status").textContent="No OTC pairs discovered";
-  }
- }catch(e){
-  $("status").textContent="Feed connection pending: "+e.message;
-  setTimeout(loadPairs,3000);
- }
+        if(s.last_scan) {
+            document.getElementById('results').textContent=
+                JSON.stringify(s.last_scan,null,2);
+        }
+    } catch(e) {
+        document.getElementById('connection').textContent='ERROR';
+    }
 }
 
-async function toggleScan(){
- if(running){
-  stopScan();
- }else{
-  startScan();
- }
+async function start() {
+    await api('/api/start');
+    refresh();
 }
 
-function startScan(){
- if(!pairs.length){
-  $("info").textContent="Waiting for OTC market instruments...";
-  loadPairs();
-  return;
- }
-
- running=true;
- $("toggle").textContent="■ STOP LIVE SCAN";
- $("toggle").className="stop";
- $("info").textContent="M1 scanner is running";
- scanNow();
- scanTimer=setInterval(scanNow,15000);
- stateTimer=setInterval(loadState,1800);
+async function stop() {
+    await api('/api/stop');
+    refresh();
 }
 
-function stopScan(){
- running=false;
- clearInterval(scanTimer);
- clearInterval(stateTimer);
- $("toggle").textContent="▶ START M1 LIVE SCAN";
- $("toggle").className="start";
- $("info").textContent="Scanner stopped";
+async function analyze() {
+    const p=document.getElementById('pair').value;
+    if(!p) return;
+    const r=await api('/api/analyze?pair='+encodeURIComponent(p));
+    showSignal(r);
 }
 
-async function scanNow(){
- if(!running)return;
-
- $("info").textContent="Scanning all OTC pairs...";
- try{
-  const j=await request("/api/scan");
-  const list=j.results||j.signals||[];
-
-  $("results").innerHTML="";
-
-  if(!list.length){
-   $("results").textContent=
-    "No signals yet. Waiting for enough closed M1 candles.";
-   return;
-  }
-
-  list.forEach(x=>{
-   const action=String(x.action||x.signal||"NEUTRAL").toUpperCase();
-   const cls=action==="CALL"||action==="UP"?"green":
-             action==="PUT"||action==="DOWN"?"red":"muted";
-
-   const div=document.createElement("div");
-   div.className="item";
-
-   const left=document.createElement("div");
-   const name=document.createElement("b");
-   name.textContent=x.asset||x.pair||"Unknown";
-   const detail=document.createElement("div");
-   detail.className="muted";
-   detail.textContent=x.note||x.reason||"M1 analysis";
-   left.append(name,detail);
-
-   const right=document.createElement("b");
-   right.className=cls;
-   right.textContent=action;
-
-   div.append(left,right);
-   $("results").appendChild(div);
-  });
-
-  $("info").textContent="Last scan: "+new Date().toLocaleTimeString();
- }catch(e){
-  $("info").textContent="Scan error: "+e.message;
- }
+function showSignal(r) {
+    const el=document.getElementById('signal');
+    const v=(r.signal||'NEUTRAL').toUpperCase();
+    el.textContent=v;
+    el.className='signal '+(
+        v==='CALL'?'call':v==='PUT'?'put':'neutral'
+    );
+    document.getElementById('details').textContent=
+        r.reason||r.message||'No analysis details';
 }
 
-async function loadState(){
- const asset=$("pair").value;
- if(!asset)return;
-
- try{
-  const j=await request(
-   "/api/state?asset="+encodeURIComponent(asset)+"&period=60"
-  );
-
-  const c=j.candles||[];
-  candles=c;
-  $("count").textContent=c.length;
-
-  if(c.length){
-   const last=c[c.length-1];
-   $("price").textContent=Number(last[4]).toFixed(6);
-   $("updated").textContent=new Date().toLocaleTimeString();
-   drawChart();
-  }
- }catch(e){
-  $("status").textContent="State error: "+e.message;
- }
-}
-
-function drawChart(){
- const canvas=$("chart");
- const ctx=canvas.getContext("2d");
- const w=canvas.clientWidth;
- const h=230;
- const dpr=window.devicePixelRatio||1;
-
- canvas.width=w*dpr;
- canvas.height=h*dpr;
- ctx.scale(dpr,dpr);
- ctx.clearRect(0,0,w,h);
-
- if(!candles.length)return;
-
- const data=candles.slice(-45);
- const highs=data.map(x=>Number(x[3]));
- const lows=data.map(x=>Number(x[2]));
- const max=Math.max(...highs);
- const min=Math.min(...lows);
- const range=max-min||1;
- const top=15,bottom=15;
- const usable=h-top-bottom;
- const step=w/data.length;
- const body=Math.max(3,step*.48);
-
- data.forEach((c,i)=>{
-  const o=Number(c[1]),cl=Number(c[4]);
-  const hi=Number(c[3]),lo=Number(c[2]);
-  const x=i*step+step/2;
-  const y=v=>top+(max-v)/range*usable;
-  const up=cl>=o;
-
-  ctx.strokeStyle=up?"#16e0a0":"#ff6478";
-  ctx.fillStyle=ctx.strokeStyle;
-  ctx.beginPath();
-  ctx.moveTo(x,y(hi));
-  ctx.lineTo(x,y(lo));
-  ctx.stroke();
-
-  const by=Math.min(y(o),y(cl));
-  const bh=Math.max(2,Math.abs(y(o)-y(cl)));
-  ctx.fillRect(x-body/2,by,body,bh);
- });
-}
-
-$("pair").addEventListener("change",()=>{
- if(running)loadState();
-});
-
-loadPairs();
-setInterval(()=>{
- if(!running)loadPairs();
-},10000);
+refresh();
+setInterval(refresh,3000);
 </script>
 </body>
 </html>
 """
 
 
-class Hub:
-    def __init__(self, assets, store):
+class ScannerHub:
+
+    def __init__(self, store, assets):
         self.store = store
         self.assets = assets
         self.feed = None
-        self.feed_thread = None
-        self.lock = threading.RLock()
-        self.error = ""
+        self.running = False
+        self.last_scan = None
+        self.lock = threading.Lock()
+        self.thread = None
 
-        self.start_feed()
-
-    def start_feed(self):
-        try:
-            self.feed = MultiFeed(
-                self.assets,
-                [PERIOD],
-                self.store
-            )
-
-            start = getattr(self.feed, "start", None)
-
-            if callable(start):
-                start()
-            else:
-                run = getattr(self.feed, "run", None)
-                if callable(run):
-                    self.feed_thread = threading.Thread(
-                        target=run,
-                        daemon=True
-                    )
-                    self.feed_thread.start()
-                else:
-                    self.error = "MultiFeed has no start/run method"
-
-        except Exception as exc:
-            self.error = str(exc)
-            print("FEED ERROR:", exc)
-
-    def get_candles(self, asset):
-        try:
-            if self.feed:
-                data = self.feed.candles(asset, PERIOD)
-                if data:
-                    return data
-        except Exception:
-            pass
-
-        try:
-            return self.store.load(asset, PERIOD, limit=300)
-        except Exception:
-            return []
-
-    def state(self, asset):
-        data = self.get_candles(asset)
-        return {
-            "asset": asset,
-            "period": PERIOD,
-            "candles": data[-300:],
-            "count": len(data),
-            "error": self.error
-        }
-
-    def close(self):
-        try:
-            if self.feed and hasattr(self.feed, "stop"):
-                self.feed.stop()
-        except Exception:
-            pass
-
-
-def discover_otc_assets():
-    catalog = asset_catalog()
-    found = []
-
-    def walk(value):
-        if isinstance(value, dict):
-            symbols = value.get("symbols")
-            if isinstance(symbols, (list, tuple)):
-                for symbol in symbols:
-                    if isinstance(symbol, str):
-                        found.append(symbol)
-
-            for key, child in value.items():
-                if key != "symbols":
-                    walk(child)
-
-        elif isinstance(value, (list, tuple)):
-            for child in value:
-                walk(child)
-
-    walk(catalog)
-
-    # Keep only symbols explicitly marked as OTC.
-    result = sorted(set(
-        x for x in found
-        if x.lower().endswith("_otc")
-    ))
-
-    return result
-
-
-class Handler(BaseHTTPRequestHandler):
-    hub = None
-
-    def log_message(self, fmt, *args):
-        print("%s - %s" % (self.address_string(), fmt % args))
-
-    def send_json(self, data, status=200):
-        body = json.dumps(data, default=str).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        u = urlparse(self.path)
-        q = parse_qs(u.query)
-
-        if u.path == "/api/catalog":
-            self.send_json({
-                "pairs": self.hub.assets,
-                "loading": not bool(self.hub.assets),
-                "error": self.hub.error
-            })
+    def start(self):
+        if self.running:
             return
 
-        if u.path == "/api/state":
-            asset = (q.get("asset") or [
-                self.hub.assets[0] if self.hub.assets else ""
-            ])[0]
+        if not self.assets:
+            raise RuntimeError("No OTC instruments configured")
 
-            if asset not in self.hub.assets:
-                self.send_json({"error": "Unknown asset"}, 404)
+        self.running = True
+
+        def feed_worker():
+            try:
+                self.feed = MultiFeed(
+                    self.assets,
+                    [TIMEFRAME],
+                    self.store
+                )
+                self.feed.run()
+            except Exception as e:
+                print("FEED ERROR:", repr(e), flush=True)
+                self.running = False
+
+        self.thread = threading.Thread(
+            target=feed_worker,
+            daemon=True
+        )
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.feed and hasattr(self.feed, "stop"):
+            try:
+                self.feed.stop()
+            except Exception:
+                pass
+
+    def scan(self):
+        try:
+            result = scan_all(
+                self.store,
+                [TIMEFRAME],
+                "rule",
+                top=200
+            )
+            with self.lock:
+                self.last_scan = result
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    def analyze(self, pair):
+        try:
+            result = self.scan()
+            if isinstance(result, dict):
+                rows = result.get(
+                    "results",
+                    result.get("signals", [])
+                )
+            else:
+                rows = result
+
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict):
+                        symbol = row.get(
+                            "asset",
+                            row.get("symbol", row.get("pair"))
+                        )
+                        if symbol == pair:
+                            return row
+
+            return {
+                "signal": "NEUTRAL",
+                "reason": "No matching analysis result yet"
+            }
+        except Exception as e:
+            return {"signal": "NEUTRAL", "reason": str(e)}
+
+
+def discover_assets():
+    """Read OTC instruments from an optional JSON environment variable."""
+    raw = os.environ.get("OTC_ASSETS", "")
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [str(x) for x in data]
+        except Exception:
+            return [
+                x.strip() for x in raw.split(",") if x.strip()
+            ]
+
+    # Do not guess the asset_catalog() signature.
+    # Configure OTC_ASSETS until the actual instruments source is wired.
+    return []
+
+
+def make_handler(hub):
+
+    class Handler(BaseHTTPRequestHandler):
+
+        def send_json(self, data):
+            body = json.dumps(
+                data, default=str
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            path = urlparse(self.path)
+            route = path.path
+
+            if route == "/":
+                body = PAGE.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
 
-            self.send_json(self.hub.state(asset))
-            return
+            if route == "/api/state":
+                return self.send_json({
+                    "running": hub.running,
+                    "pairs": hub.assets,
+                    "last_scan": hub.last_scan
+                })
 
-        if u.path == "/api/scan":
-            try:
-                report = scan_all(
-                    self.hub.store,
-                    [PERIOD],
-                    "rule",
-                    top=200
-                )
-                self.send_json(report)
-            except Exception as exc:
-                self.send_json({
-                    "error": str(exc),
-                    "results": []
-                }, 500)
-            return
+            if route == "/api/start":
+                try:
+                    hub.start()
+                    return self.send_json({"ok": True})
+                except Exception as e:
+                    return self.send_json({"ok": False, "error": str(e)})
 
-        body = PAGE.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+            if route == "/api/stop":
+                hub.stop()
+                return self.send_json({"ok": True})
+
+            if route == "/api/scan":
+                return self.send_json(hub.scan())
+
+            if route == "/api/analyze":
+                pair = parse_qs(path.query).get("pair", [""])[0]
+                return self.send_json(hub.analyze(pair))
+
+            return self.send_json({"error": "Not found"})
+
+        def log_message(self, fmt, *args):
+            print("HTTP:", fmt % args, flush=True)
+
+    return Handler
 
 
 def main():
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--assets", default="")
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.environ.get("PORT", "10000"))
-    )
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument(
-        "--db",
-        default=os.environ.get("CANDLE_DB", "data/candles.db")
-    )
-
+    parser.add_argument("--port", type=int, default=PORT)
+    parser.add_argument("--host", default=HOST)
+    parser.add_argument("--db", default=DB_PATH)
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(args.db) or ".", exist_ok=True)
 
     store = CandleStore(args.db)
 
-    assets = [
-        x.strip()
-        for x in args.assets.split(",")
-        if x.strip()
-    ]
+    assets = (
+        [x.strip() for x in args.assets.split(",") if x.strip()]
+        if args.assets else discover_assets()
+    )
 
-    if not assets:
-        assets = discover_otc_assets()
-
-    if not assets:
-        print("WARNING: No OTC instruments discovered.")
-
-    hub = Hub(assets, store)
-    Handler.hub = hub
+    hub = ScannerHub(store, assets)
 
     server = ThreadingHTTPServer(
         (args.host, args.port),
-        Handler
+        make_handler(hub)
     )
 
-    print("QUOTEX OTC M1 SCANNER STARTED")
-    print("Port:", args.port)
-    print("OTC pairs:", len(assets))
-    print("Timeframe: 60 seconds")
+    print("QUOTEX OTC M1 SCANNER STARTED", flush=True)
+    print("Port:", args.port, flush=True)
+    print("OTC pairs configured:", len(assets), flush=True)
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        hub.close()
+        hub.stop()
         server.server_close()
 
 
