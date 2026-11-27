@@ -7,6 +7,7 @@ from pathlib import Path
 
 from market_qx_candles import MarketQX, CandleBuilder
 
+
 try:
     from provenance import FEED_ID, classify_source
 except ImportError:
@@ -19,43 +20,68 @@ except ImportError:
 TIMEFRAMES = [(60, "1m")]
 PERIODS = [60]
 
-DB_PATH = os.environ.get("CANDLE_DB", "data/candles.db")
+DB_PATH = os.environ.get(
+    "CANDLE_DB",
+    "data/candles.db",
+)
 
 
 def is_otc(symbol, info=None):
     info = info or {}
+
+    symbol_text = str(symbol).lower()
+    type_text = str(info.get("type", "")).lower()
+    name_text = str(info.get("name", "")).lower()
+
     return (
-        str(symbol).lower().endswith("_otc")
-        or "otc" in str(info.get("type", "")).lower()
+        symbol_text.endswith("_otc")
+        or "otc" in type_text
+        or "otc" in name_text
     )
 
 
 def otc_assets(instruments):
-    return [
+    return sorted([
         symbol
         for symbol, info in instruments.items()
         if is_otc(symbol, info)
-    ]
+    ])
 
 
 def asset_catalog(instruments, assets=None):
-    selected = list(assets) if assets is not None else otc_assets(instruments)
+    selected = (
+        list(assets)
+        if assets is not None
+        else otc_assets(instruments)
+    )
+
     groups = {}
 
     for symbol in selected:
-        category = str(instruments.get(symbol, {}).get("type", "OTC"))
+        info = instruments.get(symbol, {})
+        category = str(info.get("type", "OTC"))
+
         groups.setdefault(category, []).append(symbol)
 
     return [
-        {"type": name, "symbols": sorted(symbols)}
-        for name, symbols in sorted(groups.items())
+        {
+            "type": category,
+            "symbols": sorted(symbols),
+        }
+        for category, symbols in sorted(groups.items())
     ]
 
 
 class CandleStore:
+
     def __init__(self, path=DB_PATH):
         self.path = str(path)
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+
+        Path(self.path).parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
         self.lock = threading.RLock()
 
         self.db = sqlite3.connect(
@@ -104,12 +130,14 @@ class CandleStore:
 
         if "source" not in columns:
             self.db.execute(
-                "ALTER TABLE candles ADD COLUMN source TEXT DEFAULT 'live'"
+                "ALTER TABLE candles "
+                "ADD COLUMN source TEXT DEFAULT 'live'"
             )
 
         if "feed_id" not in columns:
             self.db.execute(
-                "ALTER TABLE candles ADD COLUMN feed_id TEXT DEFAULT ''"
+                "ALTER TABLE candles "
+                "ADD COLUMN feed_id TEXT DEFAULT ''"
             )
 
         self.db.commit()
@@ -120,10 +148,14 @@ class CandleStore:
         with self.lock:
             self.db.execute("""
                 INSERT OR REPLACE INTO candles
-                (asset, period, ts, open, close, high, low, source, feed_id)
+                (
+                    asset, period, ts,
+                    open, close, high, low,
+                    source, feed_id
+                )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                asset,
+                str(asset),
                 int(period),
                 int(ts),
                 float(open_),
@@ -133,6 +165,7 @@ class CandleStore:
                 str(classify_source()),
                 str(FEED_ID),
             ))
+
             self.db.commit()
 
     def add_tick(self, asset, ts, price):
@@ -140,7 +173,12 @@ class CandleStore:
             self.db.execute("""
                 INSERT INTO ticks(asset, ts, price)
                 VALUES (?, ?, ?)
-            """, (asset, float(ts), float(price)))
+            """, (
+                str(asset),
+                float(ts),
+                float(price),
+            ))
+
             self.db.commit()
 
     def get_candles(self, asset, period=60, limit=200):
@@ -151,23 +189,96 @@ class CandleStore:
                 WHERE asset=? AND period=?
                 ORDER BY ts DESC
                 LIMIT ?
-            """, (asset, int(period), int(limit))).fetchall()
+            """, (
+                str(asset),
+                int(period),
+                int(limit),
+            )).fetchall()
 
-        return [list(row) for row in reversed(rows)]
+        return [
+            list(row)
+            for row in reversed(rows)
+        ]
 
     def get(self, asset, period=60, limit=200):
-        return self.get_candles(asset, period, limit)
+        return self.get_candles(
+            asset,
+            period,
+            limit,
+        )
 
     def latest(self, asset, period=60):
-        rows = self.get_candles(asset, period, 1)
+        rows = self.get_candles(
+            asset,
+            period,
+            1,
+        )
+
         return rows[-1] if rows else None
+
+    def series(self, min_candles=0, periods=None):
+        with self.lock:
+
+            if periods:
+                placeholders = ",".join(
+                    "?" for _ in periods
+                )
+
+                query = f"""
+                    SELECT asset, period
+                    FROM candles
+                    WHERE period IN ({placeholders})
+                    GROUP BY asset, period
+                    HAVING COUNT(*) >= ?
+                    ORDER BY asset, period
+                """
+
+                params = [
+                    int(p) for p in periods
+                ]
+
+                params.append(int(min_candles))
+
+            else:
+                query = """
+                    SELECT asset, period
+                    FROM candles
+                    GROUP BY asset, period
+                    HAVING COUNT(*) >= ?
+                    ORDER BY asset, period
+                """
+
+                params = [int(min_candles)]
+
+            rows = self.db.execute(
+                query,
+                params,
+            ).fetchall()
+
+        return [
+            (row[0], int(row[1]))
+            for row in rows
+        ]
+
+    def load(self, asset, period=60, limit=5000):
+        return self.get_candles(
+            asset,
+            period,
+            limit,
+        )
 
     def get_assets(self):
         with self.lock:
-            rows = self.db.execute(
-                "SELECT DISTINCT asset FROM candles ORDER BY asset"
-            ).fetchall()
-        return [row[0] for row in rows]
+            rows = self.db.execute("""
+                SELECT DISTINCT asset
+                FROM candles
+                ORDER BY asset
+            """).fetchall()
+
+        return [
+            row[0]
+            for row in rows
+        ]
 
     @property
     def assets(self):
@@ -185,11 +296,15 @@ class CandleStore:
 
     def close(self):
         with self.lock:
-            self.db.commit()
-            self.db.close()
+            try:
+                self.db.commit()
+                self.db.close()
+            except sqlite3.Error:
+                pass
 
 
 class MultiFeed:
+
     def __init__(
         self,
         assets=None,
@@ -203,22 +318,33 @@ class MultiFeed:
         self.periods = list(periods or PERIODS)
         self.closed = False
 
-        self.qx = MarketQX(verbose=verbose).connect(
-            wait_instruments=wait_instruments
+        if not self.periods:
+            raise ValueError(
+                "At least one candle timeframe is required"
+            )
+
+        self.qx = MarketQX(
+            verbose=verbose,
+        ).connect(
+            wait_instruments=wait_instruments,
         )
 
         self.instruments = self.qx.instruments
 
         if assets:
             self.assets = [
-                a for a in assets
-                if a in self.instruments
+                asset
+                for asset in assets
+                if asset in self.instruments
             ]
         else:
-            self.assets = otc_assets(self.instruments)
+            self.assets = otc_assets(
+                self.instruments
+            )
 
         if not self.assets:
             self.qx.close()
+
             raise RuntimeError(
                 "No OTC pairs found in MarketQX instrument list."
             )
@@ -231,15 +357,32 @@ class MultiFeed:
             for period in self.periods:
                 builder = CandleBuilder(
                     period,
-                    on_closed=lambda candle, a=asset, p=period:
-                        self._save_closed(a, p, candle),
+                    on_closed=lambda candle,
+                    a=asset,
+                    p=period: self._save_closed(
+                        a,
+                        p,
+                        candle,
+                    ),
                 )
+
                 self.builders[asset][period] = builder
 
         self.qx.on_tick(self._on_tick)
 
         for asset in self.assets:
-            self.qx.follow(asset, self.periods[0])
+            try:
+                self.qx.follow(
+                    asset,
+                    self.periods[0],
+                )
+            except Exception as exc:
+                print(
+                    "FOLLOW ERROR:",
+                    asset,
+                    repr(exc),
+                    flush=True,
+                )
 
         print(
             "MarketQX connected:",
@@ -250,31 +393,79 @@ class MultiFeed:
 
     def _save_closed(self, asset, period, candle):
         try:
-            self.store.save_candle(asset, period, candle)
-        except Exception as exc:
-            print("Candle save error:", repr(exc), flush=True)
+            self.store.save_candle(
+                asset,
+                period,
+                candle,
+            )
 
-    def _on_tick(self, asset, ts, price, direction=0):
-        if self.closed or asset not in self.builders:
+        except Exception as exc:
+            print(
+                "CANDLE SAVE ERROR:",
+                repr(exc),
+                flush=True,
+            )
+
+    def _on_tick(
+        self,
+        asset,
+        ts,
+        price,
+        direction=0,
+    ):
+        if self.closed:
+            return
+
+        if asset not in self.builders:
             return
 
         try:
-            self.store.add_tick(asset, ts, price)
+            self.store.add_tick(
+                asset,
+                ts,
+                price,
+            )
 
-            for period, builder in self.builders[asset].items():
-                builder.add(ts, price)
+            for period, builder in (
+                self.builders[asset].items()
+            ):
+                builder.add(
+                    ts,
+                    price,
+                )
 
         except Exception as exc:
-            print("Tick processing error:", repr(exc), flush=True)
+            print(
+                "TICK ERROR:",
+                repr(exc),
+                flush=True,
+            )
 
-    def get_candles(self, asset, period=60, limit=200):
-        saved = self.store.get_candles(asset, period, limit)
-        builder = self.builders.get(asset, {}).get(period)
+    def get_candles(
+        self,
+        asset,
+        period=60,
+        limit=200,
+    ):
+        saved = self.store.get_candles(
+            asset,
+            period,
+            limit,
+        )
+
+        builder = (
+            self.builders
+            .get(asset, {})
+            .get(period)
+        )
 
         if builder and builder.forming:
             current = list(builder.forming)
 
-            if not saved or saved[-1][0] != current[0]:
+            if (
+                not saved
+                or saved[-1][0] != current[0]
+            ):
                 saved.append(current)
             else:
                 saved[-1] = current
@@ -289,5 +480,9 @@ class MultiFeed:
 
         try:
             self.qx.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(
+                "FEED CLOSE ERROR:",
+                repr(exc),
+                flush=True,
+            )
