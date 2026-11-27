@@ -1,18 +1,18 @@
-python:3.12-slim
+FROM python:3.12-slim
 
 WORKDIR /app
-ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PORT=10000
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY *.py ./
-COPY run_dashboard.sh run_alerts.sh ./
+COPY . .
 
-# Candle history is written here; mount a volume to keep it across restarts.
 RUN mkdir -p data out
-ENV CANDLE_DB=data/caMultiFeed
-# PaaS providers inject $PORT; default 12000 for local docker run.
-ENV PORT=12000
-EXPOSTIMEFRAMECMD ["pyCANDLE "dashboa
+
+EXPOSE 10000
+
+CMD ["python", "dashboard.py"]
