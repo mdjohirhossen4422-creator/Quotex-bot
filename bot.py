@@ -7,20 +7,23 @@ from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
 
+# SETTINGS
 PORT = int(os.getenv("PORT", "10000"))
 API_KEY = os.getenv("BDT_API_KEY", "").strip()
 
 BASE_URL = "https://bangladeshitrader.com/chart"
-PAIR_URL = BASE_URL + "/api/pairs"
-CANDLE_URL = BASE_URL + "/Qx.php"
+PAIR_URL = os.getenv("PAIR_URL", BASE_URL + "/api/pairs")
+CANDLE_URL = os.getenv("CANDLE_URL", BASE_URL + "/Qx.php")
 
 TIMEFRAME = "M1"
-CANDLE_COUNT = 100
-SCAN_INTERVAL = 3
+CANDLE_COUNT = 120
+REQUEST_DELAY = 2.1
 
 lock = threading.Lock()
+
 state = {
     "status": "Starting",
+    "timeframe": TIMEFRAME,
     "last_update": "",
     "pairs": [],
     "signals": [],
@@ -28,28 +31,36 @@ state = {
 }
 
 
-def api_get(url, params=None):
+# API REQUEST
+def api_request(url, params=None):
     if not API_KEY:
-        raise Exception("BDT_API_KEY environment variable missing")
+        raise Exception("BDT_API_KEY is missing in Render Environment")
 
-    params = params or {}
+    params = dict(params or {})
     params["key"] = API_KEY
 
     response = requests.get(url, params=params, timeout=20)
     response.raise_for_status()
-    return response.json()
+
+    data = response.json()
+
+    if isinstance(data, dict) and data.get("success") is False:
+        raise Exception(str(data.get("message", "API request failed")))
+
+    return data
 
 
+# GET QUOTEX OTC PAIRS
 def get_pairs():
-    result = api_get(PAIR_URL)
+    data = api_request(PAIR_URL)
 
-    if isinstance(result, list):
-        items = result
-    elif isinstance(result, dict):
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
         items = (
-            result.get("data")
-            or result.get("pairs")
-            or result.get("result")
+            data.get("data")
+            or data.get("pairs")
+            or data.get("result")
             or []
         )
     else:
@@ -61,7 +72,7 @@ def get_pairs():
         if isinstance(item, str):
             name = item
             broker = "quotex"
-            opened = True
+            active = True
         elif isinstance(item, dict):
             name = (
                 item.get("display")
@@ -69,8 +80,9 @@ def get_pairs():
                 or item.get("symbol")
                 or item.get("name")
             )
+
             broker = str(item.get("broker", "quotex")).lower()
-            opened = item.get("open", item.get("active", True))
+            active = item.get("open", item.get("active", True))
         else:
             continue
 
@@ -83,7 +95,7 @@ def get_pairs():
         if "quotex" not in broker:
             continue
 
-        if opened is False:
+        if active is False:
             continue
 
         pairs.append(str(name))
@@ -91,8 +103,9 @@ def get_pairs():
     return list(dict.fromkeys(pairs))
 
 
+# GET M1 CANDLES
 def get_candles(pair):
-    result = api_get(
+    data = api_request(
         CANDLE_URL,
         {
             "pair": pair,
@@ -101,19 +114,19 @@ def get_candles(pair):
         }
     )
 
-    if not isinstance(result, dict) or not result.get("success", True):
-        return []
-
-    candles = result.get("data", [])
-
-    if not isinstance(candles, list):
-        return []
+    if isinstance(data, dict):
+        candles = data.get("data", [])
+    elif isinstance(data, list):
+        candles = data
+    else:
+        candles = []
 
     cleaned = []
 
     for candle in candles:
         try:
             cleaned.append({
+                "time": candle.get("time"),
                 "open": float(candle["open"]),
                 "high": float(candle["high"]),
                 "low": float(candle["low"]),
@@ -125,30 +138,32 @@ def get_candles(pair):
     return cleaned
 
 
-def ema(values, period):
+# EMA
+def calculate_ema(values, period):
     if len(values) < period:
         return None
 
     multiplier = 2 / (period + 1)
-    value = sum(values[:period]) / period
+    result = sum(values[:period]) / period
 
-    for price in values[period:]:
-        value = (price - value) * multiplier + value
+    for value in values[period:]:
+        result = (value - result) * multiplier + result
 
-    return value
+    return result
 
 
-def rsi(values, period=14):
+# RSI
+def calculate_rsi(values, period=14):
     if len(values) <= period:
         return 50
 
-    gains = []
-    losses = []
+    changes = [
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
+    ]
 
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+    gains = [max(x, 0) for x in changes]
+    losses = [max(-x, 0) for x in changes]
 
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
@@ -160,54 +175,110 @@ def rsi(values, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def analyze(pair, candles):
-    if len(candles) < 30:
+# MACD
+def calculate_macd(values):
+    if len(values) < 35:
+        return 0, 0
+
+    fast = calculate_ema(values, 12)
+    slow = calculate_ema(values, 26)
+
+    if fast is None or slow is None:
+        return 0, 0
+
+    macd = fast - slow
+
+    previous_fast = calculate_ema(values[:-1], 12)
+    previous_slow = calculate_ema(values[:-1], 26)
+
+    previous_macd = (
+        previous_fast - previous_slow
+        if previous_fast is not None and previous_slow is not None
+        else 0
+    )
+
+    return macd, macd - previous_macd
+
+
+# MARKET ANALYSIS ENGINE
+def analyze_market(pair, candles):
+    if len(candles) < 35:
         return None
 
     closes = [c["close"] for c in candles]
 
-    fast = ema(closes, 9)
-    slow = ema(closes, 21)
-    strength = rsi(closes)
+    ema9 = calculate_ema(closes, 9)
+    ema21 = calculate_ema(closes, 21)
+    ema50 = calculate_ema(closes, 50)
+    rsi = calculate_rsi(closes)
+    macd, macd_signal = calculate_macd(closes)
 
-    if fast is None or slow is None:
-        return None
+    latest = candles[-1]
+    previous = candles[-2]
 
     score = 0
     reasons = []
 
-    if fast > slow:
+    # EMA TREND
+    if ema9 > ema21:
         score += 1
         reasons.append("EMA bullish")
-    elif fast < slow:
+    elif ema9 < ema21:
         score -= 1
         reasons.append("EMA bearish")
 
-    if strength >= 55 and strength < 75:
+    if ema21 > ema50:
+        score += 1
+        reasons.append("Long trend bullish")
+    elif ema21 < ema50:
+        score -= 1
+        reasons.append("Long trend bearish")
+
+    # RSI
+    if 52 <= rsi < 70:
         score += 1
         reasons.append("RSI bullish")
-    elif strength <= 45 and strength > 25:
+    elif 30 < rsi <= 48:
         score -= 1
         reasons.append("RSI bearish")
+    elif rsi >= 75:
+        reasons.append("RSI overbought")
+    elif rsi <= 25:
+        reasons.append("RSI oversold")
 
-    previous = candles[-2]
-    latest = candles[-1]
+    # MACD
+    if macd > macd_signal:
+        score += 1
+        reasons.append("MACD bullish")
+    elif macd < macd_signal:
+        score -= 1
+        reasons.append("MACD bearish")
 
+    # CANDLE ANALYSIS
     if latest["close"] > latest["open"]:
         score += 1
-        reasons.append("Bullish candle")
+        reasons.append("Green candle")
     elif latest["close"] < latest["open"]:
         score -= 1
-        reasons.append("Bearish candle")
+        reasons.append("Red candle")
 
-    if score >= 2:
-        signal = "UP"
-    elif score <= -2:
-        signal = "DOWN"
+    # SUPPORT AND RESISTANCE
+    recent = candles[-20:]
+    support = min(c["low"] for c in recent)
+    resistance = max(c["high"] for c in recent)
+
+    # FINAL SIGNAL
+    if score >= 3:
+        signal = "CALL"
+        trend = "BULLISH"
+    elif score <= -3:
+        signal = "PUT"
+        trend = "BEARISH"
     else:
         signal = "WAIT"
+        trend = "SIDEWAYS"
 
-    confidence = min(95, 50 + abs(score) * 12)
+    confidence = min(95, 50 + abs(score) * 8)
 
     if signal == "WAIT":
         confidence = 50
@@ -216,16 +287,22 @@ def analyze(pair, candles):
         "pair": pair,
         "timeframe": TIMEFRAME,
         "signal": signal,
+        "trend": trend,
         "confidence": confidence,
-        "rsi": round(strength, 2),
-        "ema9": round(fast, 6),
-        "ema21": round(slow, 6),
+        "score": score,
+        "rsi": round(rsi, 2),
+        "ema9": round(ema9, 6),
+        "ema21": round(ema21, 6),
+        "macd": round(macd, 6),
+        "support": round(support, 6),
+        "resistance": round(resistance, 6),
         "price": latest["close"],
         "reasons": reasons,
         "updated": datetime.now().strftime("%H:%M:%S")
     }
 
 
+# BACKGROUND SCANNER
 def scanner():
     while True:
         try:
@@ -236,18 +313,29 @@ def scanner():
             pairs = get_pairs()
             results = []
 
+            if not pairs:
+                raise Exception(
+                    "No Quotex OTC pairs found. Check pair API response."
+                )
+
             for pair in pairs:
                 try:
                     candles = get_candles(pair)
-                    result = analyze(pair, candles)
+                    result = analyze_market(pair, candles)
 
                     if result:
                         results.append(result)
 
-                except Exception as exc:
-                    print("Pair error:", pair, str(exc))
+                    print(
+                        pair,
+                        result["signal"] if result else "Not enough candles",
+                        flush=True
+                    )
 
-                time.sleep(SCAN_INTERVAL)
+                except Exception as exc:
+                    print("Pair error:", pair, str(exc), flush=True)
+
+                time.sleep(REQUEST_DELAY)
 
             results.sort(
                 key=lambda x: x["confidence"],
@@ -260,91 +348,94 @@ def scanner():
                 state["last_update"] = datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
-                state["status"] = "Active"
+                state["status"] = "ACTIVE"
 
             print(
-                "Scan complete:",
+                "SCAN COMPLETE:",
                 len(pairs),
                 "pairs;",
                 len(results),
-                "signals"
+                "analyzed",
+                flush=True
             )
 
         except Exception as exc:
             with lock:
-                state["status"] = "API Error"
+                state["status"] = "API ERROR"
                 state["error"] = str(exc)
 
-            print("Scanner error:", str(exc))
+            print("SCANNER ERROR:", str(exc), flush=True)
 
-        time.sleep(10)
+        time.sleep(5)
 
 
+# DASHBOARD
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>QUOTEX OTC LIVE SCANNER</title>
+<title>QUOTEX MARKET AI SCANNER</title>
 <style>
 *{box-sizing:border-box}
-body{margin:0;background:#101522;color:#fff;font-family:Arial;padding:15px}
-h2{color:#32d9a0}
-.card{background:#1c2638;padding:15px;border-radius:12px;margin:12px 0}
-.stat{display:flex;justify-content:space-between;gap:10px}
-.green{color:#32d9a0}
-.red{color:#ff647c}
+body{margin:0;padding:15px;background:#09111f;color:white;font-family:Arial}
+.main{max-width:850px;margin:auto}
+h2{text-align:center;color:#35e5b0}
+.card{background:#17243a;padding:16px;border-radius:13px;margin:12px 0}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.stat{background:#0c1729;padding:13px;border-radius:9px}
+.stat b{display:block;font-size:22px;margin-top:7px}
+.green{color:#32e6a5}
+.red{color:#ff637b}
 .yellow{color:#ffd166}
+.muted{color:#aab9cf;font-size:12px}
 table{width:100%;border-collapse:collapse;font-size:13px}
-td,th{padding:10px 5px;border-bottom:1px solid #39445a;text-align:left}
-button{background:#32d9a0;border:0;padding:10px 15px;border-radius:7px;font-weight:bold}
-.small{color:#aab6ca;font-size:12px}
+td,th{text-align:left;padding:10px 5px;border-bottom:1px solid #35445d}
 </style>
 </head>
 <body>
-<h2>QUOTEX OTC LIVE SCANNER</h2>
+<div class="main">
+<h2>⚡ QUOTEX OTC MARKET AI SCANNER</h2>
 
 <div class="card">
-<div class="stat">
-<b>Status</b>
-<b id="status">Loading...</b>
+<div class="grid">
+<div class="stat">STATUS<b id="status">Loading</b></div>
+<div class="stat">TIMEFRAME<b>M1</b></div>
+<div class="stat">OTC PAIRS<b id="pairs">0</b></div>
+<div class="stat">ANALYZED<b id="analyzed">0</b></div>
 </div>
-<p class="small">Last update: <span id="updated">--</span></p>
-<div class="stat">
-<span>OTC Pairs</span>
-<b id="pairs">0</b>
-</div>
-<div class="stat">
-<span>Analyzed</span>
-<b id="analyzed">0</b>
-</div>
+<p class="muted">Last update: <span id="updated">--</span></p>
 </div>
 
 <div class="card">
-<h3>M1 LIVE SIGNALS</h3>
-<p class="small">UP / DOWN / WAIT</p>
+<h3>LIVE MARKET SIGNALS</h3>
 <table>
 <thead>
 <tr>
 <th>PAIR</th>
 <th>SIGNAL</th>
+<th>TREND</th>
 <th>CONF.</th>
 <th>RSI</th>
 </tr>
 </thead>
 <tbody id="signals">
-<tr><td colspan="4">Waiting for data...</td></tr>
+<tr><td colspan="5">Waiting for live data...</td></tr>
 </tbody>
 </table>
 </div>
 
 <div class="card">
-<b>API Information</b>
-<p class="small" id="error">No error</p>
-<p class="small">Signals are statistical estimates, not guaranteed predictions.</p>
+<h3>MARKET DETAILS</h3>
+<div id="details" class="muted">Select a signal to view details.</div>
 </div>
 
-<button onclick="loadData()">Refresh Now</button>
+<div class="card">
+<h3>API STATUS</h3>
+<p id="error" class="muted">No error</p>
+<p class="muted">Statistical analysis only. Signals are not guaranteed predictions.</p>
+</div>
+</div>
 
 <script>
 async function loadData(){
@@ -353,29 +444,49 @@ async function loadData(){
   const data=await response.json();
 
   document.getElementById('status').textContent=data.status;
-  document.getElementById('updated').textContent=data.last_update||'--';
   document.getElementById('pairs').textContent=data.pairs.length;
   document.getElementById('analyzed').textContent=data.signals.length;
+  document.getElementById('updated').textContent=data.last_update||'--';
   document.getElementById('error').textContent=data.error||'No error';
 
   const tbody=document.getElementById('signals');
   tbody.innerHTML='';
 
   if(!data.signals.length){
-   tbody.innerHTML='<tr><td colspan="4">No signals yet</td></tr>';
+   tbody.innerHTML='<tr><td colspan="5">No analyzed candles yet</td></tr>';
   }
 
   data.signals.forEach(item=>{
    const tr=document.createElement('tr');
-   const color=item.signal==='UP'?'green':
-               item.signal==='DOWN'?'red':'yellow';
+   const color=item.signal==='CALL'?'green':
+               item.signal==='PUT'?'red':'yellow';
 
-   [item.pair,item.signal,item.confidence+'%',item.rsi].forEach((value,index)=>{
+   const values=[
+    item.pair,
+    item.signal,
+    item.trend,
+    item.confidence+'%',
+    item.rsi
+   ];
+
+   values.forEach((value,index)=>{
     const td=document.createElement('td');
     td.textContent=value;
     if(index===1)td.className=color;
     tr.appendChild(td);
    });
+
+   tr.onclick=()=>{
+    document.getElementById('details').textContent=
+      item.pair+' | '+item.signal+
+      ' | RSI '+item.rsi+
+      ' | EMA9 '+item.ema9+
+      ' | EMA21 '+item.ema21+
+      ' | MACD '+item.macd+
+      ' | Support '+item.support+
+      ' | Resistance '+item.resistance+
+      ' | '+item.reasons.join(', ');
+   };
 
    tbody.appendChild(tr);
   });
