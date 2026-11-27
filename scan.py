@@ -1,297 +1,267 @@
 #!/usr/bin/env python3
-"""Scan every pair — one timeframe, several, or all of them — in one command.
-
-This is the batch companion to the dashboard's "Analyze" button: instead of
-picking one pair at a time, it runs the engine over the whole candle store and
-ranks the strongest CALL/PUT setups. The same `scan_all()` is what the
-dashboard's "Scan all pairs" button and the Telegram alerts use, so every
-surface agrees.
-
-Usage
------
-    python scan.py                     # 5s, all pairs
-    python scan.py 15                  # 15s
-    python scan.py --all-tf            # every timeframe that has data
-    python scan.py 5,15,60             # several timeframes
-    python scan.py --engine smart      # regime-aware engine
-    python scan.py --all-tf --top 30   # top 30 across all timeframes
-    python scan.py 5 --watch           # re-scan every 30s (live)
-    python scan.py --json              # machine-readable output
-
-Signals are alerts only — nothing is ever traded.
-"""
-from __future__ import annotations
+"""Quotex OTC M1 scanner using CandleStore."""
 
 import argparse
 import json
 import os
 import time
 
-from analysis import analyze, analyze_smart, analyze_ensemble, analyze_pa, analyze_discipline
 from candle_store import CandleStore, PERIODS
+from analysis import (
+    analyze,
+    analyze_smart,
+    analyze_ensemble,
+    analyze_pa,
+    analyze_discipline,
+)
+
 from payout import DEFAULT_PAYOUT
 
-PERIOD_LABEL = {5: "5s", 15: "15s", 30: "30s", 60: "1m",
-                120: "2m", 300: "5m", 600: "10m", 900: "15m"}
+
+PERIOD_LABEL = {
+    60: "1m",
+}
 
 
-def parse_periods(spec: str) -> list[int]:
-    """'5' -> [5]; '5,15,60' -> [5,15,60]; 'all' -> every offered timeframe."""
+def parse_periods(spec):
     if not spec or spec.strip().lower() == "all":
         return list(PERIODS)
-    out = []
-    for tok in spec.split(","):
-        tok = tok.strip()
-        if tok:
-            out.append(int(tok))
-    return out or list(PERIODS)
+
+    result = []
+
+    for item in spec.split(","):
+        item = item.strip()
+        if item:
+            result.append(int(item))
+
+    return result or list(PERIODS)
 
 
-def entry_plan(period: int, last_time: int, now: float,
-               expiry_candles: int = 1) -> dict:
-    """When to enter and when the trade expires, for a signal read off candles.
+def entry_plan(period, last_time, now, expiry_candles=1):
+    next_time = last_time + period
+    boundary = (int(now // period) + 1) * period
 
-    The engine only sees candles that have already closed, so the signal is
-    known at `last_time + period` — the open of the next candle. Binary options
-    settle on candle boundaries, so entry is snapped to the next boundary at or
-    after `now` (never a moment already in the past, which would be a look-ahead
-    lie). Expiry is that entry plus `expiry_candles` candles.
-    """
-    nxt = last_time + period                    # boundary after the last closed candle
-    boundary = int(now // period) * period      # boundary of the candle forming now
-    if boundary < now:
-        boundary += period                      # first boundary still in the future
-    entry = max(nxt, boundary)
-    n = max(1, expiry_candles)
-    expiry = entry + period * n
+    entry = max(next_time, boundary)
+    expiry = entry + period * max(1, expiry_candles)
+
     return {
         "entry_at": entry,
         "expiry_at": expiry,
-        "entry_in": max(0, int(round(entry - now))),
-        "expires_in": max(0, int(round(expiry - now))),
-        "expiry_candles": n,
+        "entry_in": max(0, int(entry - now)),
+        "expires_in": max(0, int(expiry - now)),
+        "expiry_candles": max(1, expiry_candles),
     }
 
 
-def _is_dead(candles: list[list], window: int = 20) -> bool:
-    """True if the last `window` candles never moved — a closed/illiquid pair.
-
-    Real-market pairs (non-OTC) stop ticking when the market is shut, so their
-    candles have identical open/close. Scanning them yields only flat signals.
-    """
+def is_dead(candles, window=20):
     if len(candles) < window:
         return False
-    tail = candles[-window:]
-    return all(c[1] == c[2] for c in tail)
+
+    return all(
+        candle[1] == candle[2]
+        for candle in candles[-window:]
+    )
 
 
-def scan_all(store: CandleStore, periods: list[int], engine: str = "rule",
-             top: int = 0, include_neutral: bool = False,
-             min_candles: int = 0, expiry_candles: int = 1,
-             skip_dead: bool = True, gate: bool = False,
-             gate_threshold: float = 0.55, payout: float = DEFAULT_PAYOUT) -> dict:
-    """Run the engine over every (pair, timeframe) and return a ranked report.
+def scan_all(
+    store,
+    periods=None,
+    engine="rule",
+    top=200,
+    include_neutral=True,
+    min_candles=0,
+    expiry_candles=1,
+    skip_dead=False,
+    gate=False,
+    gate_threshold=0.55,
+    payout=DEFAULT_PAYOUT,
+):
+    periods = list(periods or PERIODS)
 
-    Returns a plain dict so the dashboard, the CLI, and the alert loop can all
-    consume it. `signals` holds fired CALL/PUT results sorted by strength;
-    `ready` / `waiting` count series with and without enough candles. Every row
-    carries an entry/expiry plan (see `entry_plan`) so the caller knows *when*
-    the signal is meant to be taken, not just its direction.
+    engines = {
+        "rule": analyze,
+        "smart": analyze_smart,
+        "ensemble": analyze_ensemble,
+        "pa": analyze_pa,
+        "discipline": analyze_discipline,
+    }
 
-    `skip_dead` drops pairs whose last N candles never moved (real-market pairs
-    while the market is closed). They produce only flat, meaningless signals.
+    fn = engines.get(engine, analyze)
 
-    `gate=True` adds the meta-labeling filter (`meta.live_gate`): each fired
-    signal is scored by a model trained on that pair's earlier signals, and
-    dropped when its predicted win-probability is below `gate_threshold`. This
-    can only remove signals, never change a direction. Rows carry the gate's
-    `p_win` so the effect is visible.
-    """
-    fn = (analyze_smart if engine == "smart"
-          else analyze_ensemble if engine == "ensemble"
-          else analyze_pa if engine == "pa"
-          else analyze_discipline if engine == "discipline"
-          else analyze)
-    pairs = store.series(min_candles=min_candles, periods=periods)
-    now = time.time()
-    fired, waiting, dead = [], 0, 0
-    for asset, period in pairs:
-        cs = store.load(asset, period, limit=5000)
-        if skip_dead and _is_dead(cs):
-            dead += 1
-            continue
-        res = fn(asset, period, cs)
-        if not res.enough:
-            waiting += 1
-            continue
-        fired.append((res, cs[-1][0] if cs else 0))
-
-    signals = [(r, t) for r, t in fired if r.action != "NEUTRAL"]
-    signals.sort(key=lambda rt: (-abs(rt[0].score), rt[0].asset, rt[0].period))
-
-    gated_out = 0
-    if gate:
-        from meta import collect_signals, live_gate_batch, GATE_MAX_CANDLES
-        # Pool by (period): candle intervals differ across timeframes, so a model
-        # trained on 5s signals must not score 60s ones. For each period, build
-        # signal tables once for every fired pair, then gate them all with a
-        # single pooled model (one fit per period, not one per signal).
-        by_period: dict[int, list] = {}
-        for r, t in signals:
-            by_period.setdefault(r.period, []).append((r, t))
-        decisions: dict[tuple[str, int], object] = {}
-        for period, items in by_period.items():
-            tables: dict[str, list] = {}
-            for r, _t in items:
-                if r.asset in tables:
-                    continue
-                cs = store.load(r.asset, period, limit=GATE_MAX_CANDLES)
-                rows = collect_signals(engine, r.asset, cs)
-                if rows:
-                    tables[r.asset] = rows
-            try:
-                for asset, g in live_gate_batch(
-                        tables, threshold=gate_threshold).items():
-                    decisions[(asset, period)] = g
-            except Exception:
-                pass
-        kept = []
-        for r, t in signals:
-            g = decisions.get((r.asset, r.period))
-            if g is None:
-                kept.append((r, t, None))       # not enough history: keep as-is
-            elif g.keep:
-                kept.append((r, t, g))
-            else:
-                gated_out += 1
-        signals = [(r, t) for r, t, _ in kept]
-        gate_meta = {(r.asset, r.period): g for r, _, g in kept}
-    else:
-        gate_meta = {}
-
-    rows = signals if not include_neutral else signals + [
-        (r, t) for r, t in fired if r.action == "NEUTRAL"]
-
-    def row(r, last_time):
-        plan = entry_plan(r.period, last_time, now, expiry_candles)
-        g = gate_meta.get((r.asset, r.period))
+    try:
+        pairs = store.series(
+            min_candles=min_candles,
+            periods=periods,
+        )
+    except Exception as exc:
         return {
-            "asset": r.asset, "period": r.period,
-            "label": PERIOD_LABEL.get(r.period, f"{r.period}s"),
-            "action": r.action, "score": r.score,
-            "bull": r.bull, "bear": r.bear,
-            "regime": r.regime, "confidence": r.confidence,
-            "candles": r.candles, "reasons": r.reasons,
-            "gate": (None if g is None else {"p_win": round(g.p_win, 4),
-                                             "n_train": g.n_train}),
-            **plan,
+            "error": "Cannot read candle series: " + str(exc),
+            "signals": [],
+            "scanned": 0,
+            "signal_count": 0,
         }
+
+    now = time.time()
+
+    signals = []
+    waiting = 0
+    dead = 0
+    ready = 0
+
+    for asset, period in pairs:
+        try:
+            candles = store.load(
+                asset,
+                period,
+                limit=5000,
+            )
+
+            if skip_dead and is_dead(candles):
+                dead += 1
+                continue
+
+            if not candles:
+                waiting += 1
+                continue
+
+            result = fn(asset, period, candles)
+
+            if not result.enough:
+                waiting += 1
+                continue
+
+            ready += 1
+
+            action = str(result.action).upper()
+
+            if action == "NEUTRAL" and not include_neutral:
+                continue
+
+            last_time = int(candles[-1][0])
+
+            plan = entry_plan(
+                period,
+                last_time,
+                now,
+                expiry_candles,
+            )
+
+            signals.append({
+                "asset": asset,
+                "symbol": asset,
+                "period": period,
+                "label": PERIOD_LABEL.get(
+                    period,
+                    str(period) + "s",
+                ),
+                "action": action,
+                "signal": action,
+                "score": result.score,
+                "bull": result.bull,
+                "bear": result.bear,
+                "regime": result.regime,
+                "confidence": result.confidence,
+                "candles": result.candles,
+                "reasons": result.reasons,
+                "reason": "; ".join(
+                    str(x) for x in result.reasons
+                ),
+                "gate": None,
+                **plan,
+            })
+
+        except Exception as exc:
+            print(
+                "PAIR SCAN ERROR:",
+                asset,
+                period,
+                repr(exc),
+                flush=True,
+            )
+
+    signals.sort(
+        key=lambda row: (
+            row["action"] == "NEUTRAL",
+            -abs(row["score"]),
+        )
+    )
 
     return {
         "engine": engine,
         "periods": periods,
         "now": int(now),
         "scanned": len(pairs),
-        "ready": len(fired),
+        "ready": ready,
         "waiting": waiting,
         "dead": dead,
-        "gate": gate,
-        "gated_out": gated_out,
-        "signal_count": len(signals),
-        "signals": [row(r, t) for r, t in (rows[:top] if top else rows)],
+        "gate": False,
+        "gated_out": 0,
+        "signal_count": sum(
+            1 for row in signals
+            if row["action"] != "NEUTRAL"
+        ),
+        "signals": signals[:top] if top else signals,
     }
 
 
-def _clock(ts: int) -> str:
-    return time.strftime("%H:%M:%S", time.localtime(ts))
-
-
-def _countdown(secs: int) -> str:
-    if secs <= 0:
-        return "now"
-    if secs < 60:
-        return f"in {secs}s"
-    return f"in {secs // 60}m{secs % 60:02d}s"
-
-
-def _print_report(rep: dict, top: int):
-    labels = ",".join(PERIOD_LABEL.get(p, str(p)) for p in rep["periods"])
-    multi = len(rep["periods"]) > 1
-    scope = "all timeframes" if len(rep["periods"]) == len(PERIODS) else labels
-    print(f"\n=== scan {scope} | engine {rep['engine']} | "
-          f"{rep['scanned']} series ({rep['ready']} ready, {rep['waiting']} collecting"
-          f"{', ' + str(rep.get('dead', 0)) + ' dead' if rep.get('dead') else ''})"
-          f" | {rep['signal_count']} signals | now {_clock(rep['now'])} ===")
-    if not rep["signals"]:
-        print("  no signal above threshold right now "
-              "(that is normal — most candles are noise)")
-        return
-    for r in rep["signals"][:top]:
-        arrow = {"CALL": "▲ CALL", "PUT": "▼ PUT"}.get(r["action"], "· NEUTRAL")
-        tf = f"{r['label']:>4}" if multi else ""
-        if rep["engine"] in ("smart", "pa"):
-            detail = f"{r['regime'] or '-':5} conf {r['confidence']:.2f}"
-        else:
-            detail = f"score {r['score']:>2}  (bull {r['bull']}/bear {r['bear']})"
-        print(f"  {arrow:9} {r['asset']:14} {tf} {detail}  candles {r['candles']}")
-        print(f"             entry {_clock(r['entry_at'])} ({_countdown(r['entry_in'])})"
-              f"  →  expiry {_clock(r['expiry_at'])} ({_countdown(r['expires_in'])})")
-        for why in r["reasons"][:3]:
-            print(f"             - {why}")
-
-
 def main():
-    ap = argparse.ArgumentParser(description="Scan all pairs for signals")
-    ap.add_argument("periods", nargs="?", default="5",
-                    help="5 | 5,15,60 | all (default 5)")
-    ap.add_argument("--all-tf", action="store_true",
-                    help="scan every timeframe that has data")
-    ap.add_argument("--db", default="data/candles.db")
-    ap.add_argument("--top", type=int, default=12)
-    ap.add_argument("--all", action="store_true", help="also list NEUTRAL rows")
-    ap.add_argument("--engine", choices=["rule", "smart", "ensemble", "pa", "discipline"],
-                    default="rule")
-    ap.add_argument("--min-candles", type=int, default=0,
-                    help="only scan series with at least this many candles")
-    ap.add_argument("--expiry", type=int, default=1, metavar="N",
-                    help="expiry in candles after entry (default 1)")
-    ap.add_argument("--json", action="store_true", help="print JSON, not a table")
-    ap.add_argument("--gate", action="store_true",
-                    help="meta-labeling filter: drop signals the model expects to lose")
-    ap.add_argument("--gate-threshold", type=float, default=0.55,
-                    help="keep a signal when meta P(win) >= this (default 0.55)")
-    ap.add_argument("--watch", action="store_true",
-                    help="re-scan every 30s until Ctrl-C")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "periods",
+        nargs="?",
+        default="60",
+    )
+
+    parser.add_argument("--db", default="data/candles.db")
+    parser.add_argument("--top", type=int, default=20)
+    parser.add_argument(
+        "--engine",
+        choices=[
+            "rule",
+            "smart",
+            "ensemble",
+            "pa",
+            "discipline",
+        ],
+        default="rule",
+    )
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--watch", action="store_true")
+
+    args = parser.parse_args()
 
     if not os.path.exists(args.db):
-        raise SystemExit(f"no candle store at {args.db} — start the dashboard "
-                         f"first so it can collect candles")
+        raise SystemExit("Candle database not found: " + args.db)
 
-    periods = list(PERIODS) if args.all_tf else parse_periods(args.periods)
+    periods = parse_periods(args.periods)
     store = CandleStore(args.db)
 
-    def once():
-        rep = scan_all(store, periods, args.engine,
-                       top=args.top, include_neutral=args.all,
-                       min_candles=args.min_candles,
-                       expiry_candles=args.expiry,
-                       gate=args.gate, gate_threshold=args.gate_threshold)
-        if args.json:
-            print(json.dumps(rep, indent=2))
-        else:
-            _print_report(rep, args.top)
-        return rep
-
-    if not args.watch:
-        once()
-        return
     try:
         while True:
-            once()
-            time.sleep(30)
+            report = scan_all(
+                store,
+                periods,
+                engine=args.engine,
+                top=args.top,
+                include_neutral=args.all,
+            )
+
+            print(
+                json.dumps(report, indent=2, default=str),
+                flush=True,
+            )
+
+            if not args.watch:
+                break
+
+            time.sleep(15)
+
     except KeyboardInterrupt:
-        print("\nstopped")
+        print("Scanner stopped")
+
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":
