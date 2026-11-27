@@ -1,4 +1,4 @@
-usr/bin/env python3
+/bin/env python3
 """Quotex MarketQX multi-pair live candle store."""
 
 from __future__ import annotations
