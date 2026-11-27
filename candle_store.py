@@ -422,4 +422,4 @@ class MultiFeed:
             self.store.save_ticks(batch)
 
         if self.qx:
-            self.qx.close()
+            self.qx.close
