@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quotex OTC M1 scanner using CandleStore."""
+"""Quotex OTC M1 Hybrid Scanner."""
 
 import argparse
 import json
@@ -8,13 +8,13 @@ import time
 
 from candle_store import CandleStore, PERIODS
 from analysis import (
+    Analysis,
     analyze,
     analyze_smart,
     analyze_ensemble,
     analyze_pa,
     analyze_discipline,
 )
-
 from payout import DEFAULT_PAYOUT
 
 
@@ -28,7 +28,6 @@ def parse_periods(spec):
         return list(PERIODS)
 
     result = []
-
     for item in spec.split(","):
         item = item.strip()
         if item:
@@ -40,7 +39,6 @@ def parse_periods(spec):
 def entry_plan(period, last_time, now, expiry_candles=1):
     next_time = last_time + period
     boundary = (int(now // period) + 1) * period
-
     entry = max(next_time, boundary)
     expiry = entry + period * max(1, expiry_candles)
 
@@ -63,10 +61,212 @@ def is_dead(candles, window=20):
     )
 
 
+def _engine_confidence(result):
+    """Normalize engine confidence to 0..1."""
+
+    value = getattr(result, "confidence", 0.0)
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = 0.0
+
+    if value > 1:
+        value /= 100.0
+
+    return max(0.0, min(1.0, value))
+
+
+def _rule_confidence(result):
+    """Estimate directional strength for the rule engine."""
+
+    bull = int(getattr(result, "bull", 0) or 0)
+    bear = int(getattr(result, "bear", 0) or 0)
+
+    total = bull + bear
+
+    if total <= 0:
+        return 0.0
+
+    return min(1.0, abs(bull - bear) / total)
+
+
+def analyze_hybrid(
+    asset,
+    period,
+    candles,
+    confidence_threshold=0.80,
+    min_agreement=3,
+):
+    """
+    Four-engine hybrid analysis.
+
+    Engines:
+      1. Rule / technical indicators
+      2. Smart / regime analysis
+      3. Ensemble
+      4. Price action
+
+    Confidence is a composite score, NOT a measured win probability.
+    """
+
+    engines = {
+        "rule": analyze,
+        "smart": analyze_smart,
+        "ensemble": analyze_ensemble,
+        "pa": analyze_pa,
+    }
+
+    results = {}
+    errors = {}
+
+    for name, function in engines.items():
+        try:
+            results[name] = function(asset, period, candles)
+        except Exception as exc:
+            errors[name] = str(exc)
+
+    votes = {
+        "CALL": [],
+        "PUT": [],
+    }
+
+    details = {}
+    reasons = []
+
+    for name, result in results.items():
+        action = str(result.action).upper()
+
+        if not result.enough:
+            details[name] = {
+                "action": "WAIT",
+                "confidence": 0,
+            }
+            continue
+
+        if action not in ("CALL", "PUT"):
+            details[name] = {
+                "action": "NEUTRAL",
+                "confidence": 0,
+            }
+            continue
+
+        if name == "rule":
+            confidence = _rule_confidence(result)
+        else:
+            confidence = _engine_confidence(result)
+
+        votes[action].append({
+            "engine": name,
+            "confidence": confidence,
+        })
+
+        details[name] = {
+            "action": action,
+            "confidence": round(confidence * 100, 1),
+        }
+
+    call_votes = votes["CALL"]
+    put_votes = votes["PUT"]
+
+    if len(call_votes) > len(put_votes):
+        direction = "CALL"
+        agreeing = call_votes
+
+    elif len(put_votes) > len(call_votes):
+        direction = "PUT"
+        agreeing = put_votes
+
+    else:
+        direction = "NEUTRAL"
+        agreeing = []
+
+    available_votes = len(call_votes) + len(put_votes)
+
+    average_confidence = (
+        sum(v["confidence"] for v in agreeing) / len(agreeing)
+        if agreeing else 0.0
+    )
+
+    agreement_ratio = (
+        len(agreeing) / available_votes
+        if available_votes else 0.0
+    )
+
+    # Combined score: 65% engine confidence + 35% agreement.
+    combined = (
+        average_confidence * 0.65
+        + agreement_ratio * 0.35
+    )
+
+    final_action = "NEUTRAL"
+
+    if (
+        direction in ("CALL", "PUT")
+        and len(agreeing) >= min_agreement
+        and combined >= confidence_threshold
+    ):
+        final_action = direction
+
+    for name, result in results.items():
+        if result.reasons:
+            reasons.extend(
+                f"{name.upper()}: {reason}"
+                for reason in result.reasons[:3]
+            )
+
+    if errors:
+        for name, error in errors.items():
+            reasons.append(f"{name.upper()} ERROR: {error}")
+
+    if final_action == "NEUTRAL":
+        note = (
+            f"WAIT: confidence {combined * 100:.1f}% "
+            f"(required {confidence_threshold * 100:.0f}%), "
+            f"agreement {len(agreeing)}/{available_votes}, "
+            f"minimum {min_agreement}"
+        )
+    else:
+        note = (
+            f"HYBRID {final_action}: "
+            f"confidence score {combined * 100:.1f}%, "
+            f"agreement {len(agreeing)}/{available_votes}"
+        )
+
+    base = next(
+        (r for r in results.values() if r.enough),
+        None,
+    )
+
+    return Analysis(
+        asset=asset,
+        period=period,
+        candles=len(candles),
+        enough=base is not None,
+        action=final_action,
+        score=round(combined * 100),
+        bull=len(call_votes),
+        bear=len(put_votes),
+        reasons=reasons,
+        values={
+            "engine_votes": details,
+            "call_votes": len(call_votes),
+            "put_votes": len(put_votes),
+            "agreement": round(agreement_ratio * 100, 1),
+            "confidence_score": round(combined * 100, 1),
+            "threshold": confidence_threshold * 100,
+        },
+        note=note,
+        engine="hybrid",
+        confidence=combined,
+        regime=getattr(base, "regime", "") if base else "",
+    )
+
+
 def scan_all(
     store,
     periods=None,
-    engine="rule",
+    engine="hybrid",
     top=200,
     include_neutral=True,
     min_candles=0,
@@ -84,6 +284,7 @@ def scan_all(
         "ensemble": analyze_ensemble,
         "pa": analyze_pa,
         "discipline": analyze_discipline,
+        "hybrid": analyze_hybrid,
     }
 
     fn = engines.get(engine, analyze)
@@ -166,6 +367,8 @@ def scan_all(
                 "reason": "; ".join(
                     str(x) for x in result.reasons
                 ),
+                "note": result.note,
+                "values": result.values,
                 "gate": None,
                 **plan,
             })
@@ -182,7 +385,7 @@ def scan_all(
     signals.sort(
         key=lambda row: (
             row["action"] == "NEUTRAL",
-            -abs(row["score"]),
+            -float(row.get("confidence") or 0),
         )
     )
 
@@ -213,8 +416,17 @@ def main():
         default="60",
     )
 
-    parser.add_argument("--db", default="data/candles.db")
-    parser.add_argument("--top", type=int, default=20)
+    parser.add_argument(
+        "--db",
+        default="data/candles.db",
+    )
+
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=20,
+    )
+
     parser.add_argument(
         "--engine",
         choices=[
@@ -223,16 +435,20 @@ def main():
             "ensemble",
             "pa",
             "discipline",
+            "hybrid",
         ],
-        default="rule",
+        default="hybrid",
     )
+
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--watch", action="store_true")
 
     args = parser.parse_args()
 
     if not os.path.exists(args.db):
-        raise SystemExit("Candle database not found: " + args.db)
+        raise SystemExit(
+            "Candle database not found: " + args.db
+        )
 
     periods = parse_periods(args.periods)
     store = CandleStore(args.db)
@@ -248,7 +464,11 @@ def main():
             )
 
             print(
-                json.dumps(report, indent=2, default=str),
+                json.dumps(
+                    report,
+                    indent=2,
+                    default=str,
+                ),
                 flush=True,
             )
 
