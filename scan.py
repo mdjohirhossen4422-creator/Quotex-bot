@@ -7,6 +7,7 @@ import os
 import time
 
 from candle_store import CandleStore, PERIODS
+
 from analysis import (
     Analysis,
     analyze,
@@ -15,6 +16,7 @@ from analysis import (
     analyze_pa,
     analyze_discipline,
 )
+
 from payout import DEFAULT_PAYOUT
 
 
@@ -22,14 +24,18 @@ PERIOD_LABEL = {
     60: "1m",
 }
 
+ENGINE_COUNT = 4
+
 
 def parse_periods(spec):
     if not spec or spec.strip().lower() == "all":
         return list(PERIODS)
 
     result = []
+
     for item in spec.split(","):
         item = item.strip()
+
         if item:
             result.append(int(item))
 
@@ -39,6 +45,7 @@ def parse_periods(spec):
 def entry_plan(period, last_time, now, expiry_candles=1):
     next_time = last_time + period
     boundary = (int(now // period) + 1) * period
+
     entry = max(next_time, boundary)
     expiry = entry + period * max(1, expiry_candles)
 
@@ -61,9 +68,20 @@ def is_dead(candles, window=20):
     )
 
 
-def _engine_confidence(result):
-    """Normalize engine confidence to 0..1."""
+def _normalize_action(action):
+    action = str(action or "").upper().strip()
 
+    aliases = {
+        "UP": "CALL",
+        "BUY": "CALL",
+        "DOWN": "PUT",
+        "SELL": "PUT",
+    }
+
+    return aliases.get(action, action)
+
+
+def _engine_confidence(result):
     value = getattr(result, "confidence", 0.0)
 
     try:
@@ -78,8 +96,6 @@ def _engine_confidence(result):
 
 
 def _rule_confidence(result):
-    """Estimate directional strength for the rule engine."""
-
     bull = int(getattr(result, "bull", 0) or 0)
     bear = int(getattr(result, "bear", 0) or 0)
 
@@ -88,28 +104,19 @@ def _rule_confidence(result):
     if total <= 0:
         return 0.0
 
-    return min(1.0, abs(bull - bear) / total)
+    return min(
+        1.0,
+        abs(bull - bear) / total,
+    )
 
 
 def analyze_hybrid(
     asset,
     period,
     candles,
-    confidence_threshold=0.80,
-    min_agreement=3,
+    confidence_threshold=0.55,
+    min_agreement=2,
 ):
-    """
-    Four-engine hybrid analysis.
-
-    Engines:
-      1. Rule / technical indicators
-      2. Smart / regime analysis
-      3. Ensemble
-      4. Price action
-
-    Confidence is a composite score, NOT a measured win probability.
-    """
-
     engines = {
         "rule": analyze,
         "smart": analyze_smart,
@@ -122,7 +129,12 @@ def analyze_hybrid(
 
     for name, function in engines.items():
         try:
-            results[name] = function(asset, period, candles)
+            results[name] = function(
+                asset,
+                period,
+                candles,
+            )
+
         except Exception as exc:
             errors[name] = str(exc)
 
@@ -133,9 +145,17 @@ def analyze_hybrid(
 
     details = {}
     reasons = []
+    ready_count = 0
 
-    for name, result in results.items():
-        action = str(result.action).upper()
+    for name in engines:
+        result = results.get(name)
+
+        if result is None:
+            details[name] = {
+                "action": "ERROR",
+                "confidence": 0,
+            }
+            continue
 
         if not result.enough:
             details[name] = {
@@ -143,6 +163,10 @@ def analyze_hybrid(
                 "confidence": 0,
             }
             continue
+
+        ready_count += 1
+
+        action = _normalize_action(result.action)
 
         if action not in ("CALL", "PUT"):
             details[name] = {
@@ -181,28 +205,29 @@ def analyze_hybrid(
         direction = "NEUTRAL"
         agreeing = []
 
-    available_votes = len(call_votes) + len(put_votes)
+    total_engines = ENGINE_COUNT
 
     average_confidence = (
-        sum(v["confidence"] for v in agreeing) / len(agreeing)
+        sum(v["confidence"] for v in agreeing)
+        / len(agreeing)
         if agreeing else 0.0
     )
 
-    agreement_ratio = (
-        len(agreeing) / available_votes
-        if available_votes else 0.0
-    )
+    # Agreement is measured against all four engines.
+    agreement_ratio = len(agreeing) / total_engines
 
-    # Combined score: 65% engine confidence + 35% agreement.
     combined = (
-        average_confidence * 0.65
-        + agreement_ratio * 0.35
+        average_confidence * 0.70
+        + agreement_ratio * 0.30
     )
 
     final_action = "NEUTRAL"
 
+    enough_engines = ready_count >= 2
+
     if (
-        direction in ("CALL", "PUT")
+        enough_engines
+        and direction in ("CALL", "PUT")
         and len(agreeing) >= min_agreement
         and combined >= confidence_threshold
     ):
@@ -215,26 +240,37 @@ def analyze_hybrid(
                 for reason in result.reasons[:3]
             )
 
-    if errors:
-        for name, error in errors.items():
-            reasons.append(f"{name.upper()} ERROR: {error}")
-
-    if final_action == "NEUTRAL":
-        note = (
-            f"WAIT: confidence {combined * 100:.1f}% "
-            f"(required {confidence_threshold * 100:.0f}%), "
-            f"agreement {len(agreeing)}/{available_votes}, "
-            f"minimum {min_agreement}"
+    for name, error in errors.items():
+        reasons.append(
+            f"{name.upper()} ERROR: {error}"
         )
+
+    if not enough_engines:
+        note = (
+            f"WAIT: only {ready_count}/4 engines "
+            "have sufficient candle history"
+        )
+
+    elif final_action == "NEUTRAL":
+        note = (
+            f"WAIT: confidence score {combined * 100:.1f}%, "
+            f"agreement {len(agreeing)}/4, "
+            f"minimum agreement {min_agreement}"
+        )
+
     else:
         note = (
             f"HYBRID {final_action}: "
             f"confidence score {combined * 100:.1f}%, "
-            f"agreement {len(agreeing)}/{available_votes}"
+            f"agreement {len(agreeing)}/4"
         )
 
     base = next(
-        (r for r in results.values() if r.enough),
+        (
+            results[name]
+            for name in engines
+            if name in results and results[name].enough
+        ),
         None,
     )
 
@@ -242,7 +278,7 @@ def analyze_hybrid(
         asset=asset,
         period=period,
         candles=len(candles),
-        enough=base is not None,
+        enough=enough_engines,
         action=final_action,
         score=round(combined * 100),
         bull=len(call_votes),
@@ -252,6 +288,7 @@ def analyze_hybrid(
             "engine_votes": details,
             "call_votes": len(call_votes),
             "put_votes": len(put_votes),
+            "ready_engines": ready_count,
             "agreement": round(agreement_ratio * 100, 1),
             "confidence_score": round(combined * 100, 1),
             "threshold": confidence_threshold * 100,
@@ -294,11 +331,14 @@ def scan_all(
             min_candles=min_candles,
             periods=periods,
         )
+
     except Exception as exc:
         return {
             "error": "Cannot read candle series: " + str(exc),
             "signals": [],
             "scanned": 0,
+            "ready": 0,
+            "waiting": 0,
             "signal_count": 0,
         }
 
@@ -308,6 +348,7 @@ def scan_all(
     waiting = 0
     dead = 0
     ready = 0
+    scan_errors = []
 
     for asset, period in pairs:
         try:
@@ -325,7 +366,11 @@ def scan_all(
                 waiting += 1
                 continue
 
-            result = fn(asset, period, candles)
+            result = fn(
+                asset,
+                period,
+                candles,
+            )
 
             if not result.enough:
                 waiting += 1
@@ -333,7 +378,10 @@ def scan_all(
 
             ready += 1
 
-            action = str(result.action).upper()
+            action = _normalize_action(result.action)
+
+            if action not in ("CALL", "PUT"):
+                action = "NEUTRAL"
 
             if action == "NEUTRAL" and not include_neutral:
                 continue
@@ -374,11 +422,15 @@ def scan_all(
             })
 
         except Exception as exc:
+            message = (
+                f"{asset} {period}: {repr(exc)}"
+            )
+
+            scan_errors.append(message)
+
             print(
                 "PAIR SCAN ERROR:",
-                asset,
-                period,
-                repr(exc),
+                message,
                 flush=True,
             )
 
@@ -389,6 +441,11 @@ def scan_all(
         )
     )
 
+    signal_count = sum(
+        1 for row in signals
+        if row["action"] in ("CALL", "PUT")
+    )
+
     return {
         "engine": engine,
         "periods": periods,
@@ -397,12 +454,10 @@ def scan_all(
         "ready": ready,
         "waiting": waiting,
         "dead": dead,
+        "errors": scan_errors[:20],
         "gate": False,
         "gated_out": 0,
-        "signal_count": sum(
-            1 for row in signals
-            if row["action"] != "NEUTRAL"
-        ),
+        "signal_count": signal_count,
         "signals": signals[:top] if top else signals,
     }
 
