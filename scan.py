@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Quotex OTC M1 Hybrid Scanner with 5th AI-style Sensor."""
+"""Quotex OTC M1 Hybrid Scanner - 5 Engine + AI Sensor."""
 
 import argparse
 import json
 import os
 import time
+import math
 
 from candle_store import CandleStore, PERIODS
 
@@ -20,10 +21,7 @@ from analysis import (
 from payout import DEFAULT_PAYOUT
 
 
-PERIOD_LABEL = {
-    60: "1m",
-}
-
+PERIOD_LABEL = {60: "1m"}
 ENGINE_COUNT = 5
 
 
@@ -32,7 +30,6 @@ def parse_periods(spec):
         return list(PERIODS)
 
     result = []
-
     for item in spec.split(","):
         item = item.strip()
         if item:
@@ -62,8 +59,8 @@ def is_dead(candles, window=20):
         return False
 
     return all(
-        candle[1] == candle[2]
-        for candle in candles[-window:]
+        float(c[1]) == float(c[2])
+        for c in candles[-window:]
     )
 
 
@@ -81,12 +78,10 @@ def _normalize_action(action):
 
 
 def _engine_confidence(result):
-    value = getattr(result, "confidence", 0.0)
-
     try:
-        value = float(value)
+        value = float(getattr(result, "confidence", 0) or 0)
     except (TypeError, ValueError):
-        value = 0.0
+        return 0.0
 
     if value > 1:
         value /= 100.0
@@ -99,15 +94,21 @@ def _rule_confidence(result):
     bear = int(getattr(result, "bear", 0) or 0)
 
     total = bull + bear
-
     if total <= 0:
         return 0.0
 
     return min(1.0, abs(bull - bear) / total)
 
 
+def _valid_number(value):
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
 # --------------------------------------------------
-# 5TH ENGINE: AI-STYLE CANDLE SENSOR
+# INDICATORS
 # --------------------------------------------------
 
 def _ema(values, period):
@@ -130,13 +131,13 @@ def _rsi(values, period=14):
     if len(values) <= period:
         return None
 
-    gains = []
-    losses = []
+    changes = [
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
+    ]
 
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+    gains = [max(x, 0.0) for x in changes]
+    losses = [max(-x, 0.0) for x in changes]
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
@@ -157,43 +158,64 @@ def _rsi(values, period=14):
     return 100.0 - (100.0 / (1.0 + rs))
 
 
+# --------------------------------------------------
+# 5TH ENGINE: AI-STYLE SENSOR
+# --------------------------------------------------
+
 def analyze_ai_sensor(asset, period, candles):
     """
-    Local AI-style sensor.
-    Uses EMA trend, momentum, RSI and candle strength.
-    Requires at least 25 closed candles.
+    Indicator-based AI-style sensor.
+    Candle format: [timestamp, open, close, high, low]
+    Requires 25 closed candles.
     """
 
-    if len(candles) < 25:
+    count = len(candles)
+
+    if count < 25:
         return Analysis(
             asset=asset,
             period=period,
-            candles=len(candles),
+            candles=count,
             enough=False,
             action="NEUTRAL",
-            note="AI SENSOR: waiting for 25 candles",
+            reasons=[],
+            values={
+                "sensor_status": "WAITING",
+                "required_candles": 25,
+                "available_candles": count,
+            },
+            note=f"AI SENSOR WAIT: {count}/25 candles",
             engine="ai_sensor",
+            confidence=0.0,
         )
 
     try:
-        opens = [float(c[1]) for c in candles]
-        highs = [float(c[2]) for c in candles]
-        lows = [float(c[3]) for c in candles]
-        closes = [float(c[4]) for c in candles]
+        # Correct OHLC indexing:
+        # [timestamp, open, close, high, low]
 
-        if any(
-            not all(map(
-                lambda x: x == x and abs(x) != float("inf"),
-                values
-            ))
-            for values in (opens, highs, lows, closes)
-        ):
-            raise ValueError("Invalid candle values")
+        opens = [float(c[1]) for c in candles]
+        closes = [float(c[2]) for c in candles]
+        highs = [float(c[3]) for c in candles]
+        lows = [float(c[4]) for c in candles]
+
+        for values in (opens, closes, highs, lows):
+            if not all(_valid_number(x) for x in values):
+                raise ValueError("Invalid candle price")
+
+        for i in range(count):
+            if highs[i] < lows[i]:
+                raise ValueError("Invalid candle high/low")
+
+            if highs[i] < max(opens[i], closes[i]):
+                raise ValueError("High below open/close")
+
+            if lows[i] > min(opens[i], closes[i]):
+                raise ValueError("Low above open/close")
 
         score = 0.0
         reasons = []
 
-        # 1. EMA trend sensor
+        # 1. EMA trend
         ema9 = _ema(closes[-40:], 9)
         ema21 = _ema(closes[-40:], 21)
 
@@ -205,7 +227,7 @@ def analyze_ai_sensor(asset, period, candles):
                 score -= 1.5
                 reasons.append("EMA trend bearish")
 
-        # 2. Price momentum sensor
+        # 2. Momentum
         momentum = closes[-1] - closes[-6]
 
         if momentum > 0:
@@ -215,22 +237,22 @@ def analyze_ai_sensor(asset, period, candles):
             score -= 1.0
             reasons.append("Price momentum DOWN")
 
-        # 3. RSI sensor
+        # 3. RSI
         rsi = _rsi(closes, 14)
 
         if rsi is not None:
             if 52 <= rsi <= 70:
                 score += 1.0
-                reasons.append("RSI bullish momentum")
+                reasons.append("RSI bullish")
             elif 30 <= rsi <= 48:
                 score -= 1.0
-                reasons.append("RSI bearish momentum")
+                reasons.append("RSI bearish")
             elif rsi > 75:
                 score -= 0.5
-                reasons.append("RSI overbought warning")
+                reasons.append("RSI overbought")
             elif rsi < 25:
                 score += 0.5
-                reasons.append("RSI oversold warning")
+                reasons.append("RSI oversold")
 
         # 4. Latest candle strength
         candle_open = opens[-1]
@@ -241,18 +263,20 @@ def analyze_ai_sensor(asset, period, candles):
         candle_range = candle_high - candle_low
         body = candle_close - candle_open
 
-        if candle_range > 0:
-            body_strength = abs(body) / candle_range
+        body_strength = (
+            abs(body) / candle_range
+            if candle_range > 0 else 0.0
+        )
 
-            if body > 0 and body_strength >= 0.55:
-                score += 1.0
-                reasons.append("Strong bullish candle")
+        if body > 0 and body_strength >= 0.55:
+            score += 1.0
+            reasons.append("Strong bullish candle")
 
-            elif body < 0 and body_strength >= 0.55:
-                score -= 1.0
-                reasons.append("Strong bearish candle")
+        elif body < 0 and body_strength >= 0.55:
+            score -= 1.0
+            reasons.append("Strong bearish candle")
 
-        # 5. Recent high/low structure
+        # 5. Recent breakout
         recent_high = max(highs[-6:-1])
         recent_low = min(lows[-6:-1])
 
@@ -264,7 +288,7 @@ def analyze_ai_sensor(asset, period, candles):
             score -= 0.5
             reasons.append("Recent low breakdown")
 
-        # Final sensor decision
+        # Final decision
         if score >= 2.0:
             action = "CALL"
         elif score <= -2.0:
@@ -277,7 +301,7 @@ def analyze_ai_sensor(asset, period, candles):
         return Analysis(
             asset=asset,
             period=period,
-            candles=len(candles),
+            candles=count,
             enough=True,
             action=action,
             score=round(score * 20),
@@ -285,14 +309,17 @@ def analyze_ai_sensor(asset, period, candles):
             bear=1 if score < 0 else 0,
             reasons=reasons,
             values={
+                "sensor_status": "ACTIVE",
                 "sensor_score": round(score, 2),
                 "ema9": ema9,
                 "ema21": ema21,
                 "rsi": round(rsi, 2) if rsi is not None else None,
                 "momentum": momentum,
-                "candle_strength": (
-                    round(abs(body) / candle_range, 3)
-                    if candle_range > 0 else 0
+                "candle_strength": round(body_strength, 3),
+                "direction": (
+                    "UP" if action == "CALL"
+                    else "DOWN" if action == "PUT"
+                    else "NEUTRAL"
                 ),
             },
             note=f"AI SENSOR score: {score:.2f}/5",
@@ -304,16 +331,19 @@ def analyze_ai_sensor(asset, period, candles):
         return Analysis(
             asset=asset,
             period=period,
-            candles=len(candles),
+            candles=count,
             enough=False,
             action="NEUTRAL",
+            reasons=[],
+            values={"sensor_status": "ERROR"},
             note=f"AI SENSOR ERROR: {exc}",
             engine="ai_sensor",
+            confidence=0.0,
         )
 
 
 # --------------------------------------------------
-# 5 ENGINE HYBRID ANALYSIS
+# HYBRID ENGINE
 # --------------------------------------------------
 
 def analyze_hybrid(
@@ -336,19 +366,11 @@ def analyze_hybrid(
 
     for name, function in engines.items():
         try:
-            results[name] = function(
-                asset,
-                period,
-                candles,
-            )
+            results[name] = function(asset, period, candles)
         except Exception as exc:
             errors[name] = str(exc)
 
-    votes = {
-        "CALL": [],
-        "PUT": [],
-    }
-
+    votes = {"CALL": [], "PUT": []}
     details = {}
     reasons = []
     ready_count = 0
@@ -367,6 +389,7 @@ def analyze_hybrid(
             details[name] = {
                 "action": "WAIT",
                 "confidence": 0,
+                "note": getattr(result, "note", ""),
             }
             continue
 
@@ -380,10 +403,11 @@ def analyze_hybrid(
             }
             continue
 
-        if name == "rule":
-            confidence = _rule_confidence(result)
-        else:
-            confidence = _engine_confidence(result)
+        confidence = (
+            _rule_confidence(result)
+            if name == "rule"
+            else _engine_confidence(result)
+        )
 
         votes[action].append({
             "engine": name,
@@ -402,18 +426,15 @@ def analyze_hybrid(
     if len(call_votes) > len(put_votes):
         direction = "CALL"
         agreeing = call_votes
-
     elif len(put_votes) > len(call_votes):
         direction = "PUT"
         agreeing = put_votes
-
     else:
         direction = "NEUTRAL"
         agreeing = []
 
     average_confidence = (
-        sum(v["confidence"] for v in agreeing)
-        / len(agreeing)
+        sum(v["confidence"] for v in agreeing) / len(agreeing)
         if agreeing else 0.0
     )
 
@@ -424,9 +445,8 @@ def analyze_hybrid(
         + agreement_ratio * 0.30
     )
 
-    final_action = "NEUTRAL"
-
     enough_engines = ready_count >= 2
+    final_action = "NEUTRAL"
 
     if (
         enough_engines
@@ -437,29 +457,21 @@ def analyze_hybrid(
         final_action = direction
 
     for name, result in results.items():
-        if result.reasons:
-            reasons.extend(
-                f"{name.upper()}: {reason}"
-                for reason in result.reasons[:3]
-            )
+        for reason in (getattr(result, "reasons", []) or [])[:3]:
+            reasons.append(f"{name.upper()}: {reason}")
 
     for name, error in errors.items():
-        reasons.append(
-            f"{name.upper()} ERROR: {error}"
-        )
+        reasons.append(f"{name.upper()} ERROR: {error}")
 
     if not enough_engines:
         note = (
-            f"WAIT: only {ready_count}/{ENGINE_COUNT} engines "
-            "have sufficient candle history"
+            f"WAIT: {ready_count}/{ENGINE_COUNT} engines ready"
         )
-
     elif final_action == "NEUTRAL":
         note = (
             f"WAIT: score {combined * 100:.1f}%, "
             f"agreement {len(agreeing)}/{ENGINE_COUNT}"
         )
-
     else:
         note = (
             f"HYBRID {final_action}: "
@@ -495,6 +507,7 @@ def analyze_hybrid(
             "agreement": round(agreement_ratio * 100, 1),
             "confidence_score": round(combined * 100, 1),
             "threshold": confidence_threshold * 100,
+            "ai_sensor": details.get("ai_sensor", {}),
         },
         note=note,
         engine="hybrid",
@@ -539,10 +552,11 @@ def scan_all(
             min_candles=min_candles,
             periods=periods,
         )
-
     except Exception as exc:
         return {
+            "engine": engine,
             "error": "Cannot read candle series: " + str(exc),
+            "message": "CANDLE DATABASE ERROR",
             "signals": [],
             "scanned": 0,
             "ready": 0,
@@ -557,14 +571,17 @@ def scan_all(
     dead = 0
     ready = 0
     scan_errors = []
+    history = []
 
     for asset, period in pairs:
         try:
-            candles = store.load(
-                asset,
-                period,
-                limit=5000,
-            )
+            candles = store.load(asset, period, limit=5000)
+
+            history.append({
+                "asset": asset,
+                "period": period,
+                "candles": len(candles),
+            })
 
             if skip_dead and is_dead(candles):
                 dead += 1
@@ -574,11 +591,7 @@ def scan_all(
                 waiting += 1
                 continue
 
-            result = fn(
-                asset,
-                period,
-                candles,
-            )
+            result = fn(asset, period, candles)
 
             if not result.enough:
                 waiting += 1
@@ -613,31 +626,23 @@ def scan_all(
                 "asset": asset,
                 "symbol": asset,
                 "period": period,
-                "label": PERIOD_LABEL.get(
-                    period,
-                    str(period) + "s",
-                ),
-
-                # Existing compatibility
+                "label": PERIOD_LABEL.get(period, str(period) + "s"),
                 "action": action,
-
-                # UP/DOWN display fields
                 "direction": direction,
                 "signal": direction,
                 "display_signal": direction,
-
                 "score": result.score,
                 "bull": result.bull,
                 "bear": result.bear,
                 "regime": result.regime,
                 "confidence": result.confidence,
                 "candles": result.candles,
-                "reasons": result.reasons,
+                "reasons": result.reasons or [],
                 "reason": "; ".join(
-                    str(x) for x in result.reasons
+                    str(x) for x in (result.reasons or [])
                 ),
                 "note": result.note,
-                "values": result.values,
+                "values": result.values or {},
                 "gate": None,
                 **plan,
             })
@@ -645,12 +650,7 @@ def scan_all(
         except Exception as exc:
             message = f"{asset} {period}: {repr(exc)}"
             scan_errors.append(message)
-
-            print(
-                "PAIR SCAN ERROR:",
-                message,
-                flush=True,
-            )
+            print("PAIR SCAN ERROR:", message, flush=True)
 
     signals.sort(
         key=lambda row: (
@@ -664,6 +664,13 @@ def scan_all(
         if row["action"] in ("CALL", "PUT")
     )
 
+    if not pairs:
+        message = "NO CANDLES IN DATABASE"
+    elif ready == 0:
+        message = "WAITING FOR SUFFICIENT CLOSED M1 CANDLES"
+    else:
+        message = f"SCAN COMPLETE: {ready} PAIRS ANALYZED"
+
     return {
         "engine": engine,
         "periods": periods,
@@ -673,6 +680,8 @@ def scan_all(
         "waiting": waiting,
         "dead": dead,
         "errors": scan_errors[:20],
+        "history": history[:100],
+        "message": message,
         "gate": False,
         "gated_out": 0,
         "signal_count": signal_count,
@@ -687,22 +696,9 @@ def scan_all(
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument(
-        "periods",
-        nargs="?",
-        default="60",
-    )
-
-    parser.add_argument(
-        "--db",
-        default="data/candles.db",
-    )
-
-    parser.add_argument(
-        "--top",
-        type=int,
-        default=20,
-    )
+    parser.add_argument("periods", nargs="?", default="60")
+    parser.add_argument("--db", default="data/candles.db")
+    parser.add_argument("--top", type=int, default=20)
 
     parser.add_argument(
         "--engine",
@@ -724,9 +720,7 @@ def main():
     args = parser.parse_args()
 
     if not os.path.exists(args.db):
-        raise SystemExit(
-            "Candle database not found: " + args.db
-        )
+        raise SystemExit("Candle database not found: " + args.db)
 
     periods = parse_periods(args.periods)
     store = CandleStore(args.db)
@@ -742,11 +736,7 @@ def main():
             )
 
             print(
-                json.dumps(
-                    report,
-                    indent=2,
-                    default=str,
-                ),
+                json.dumps(report, indent=2, default=str),
                 flush=True,
             )
 
