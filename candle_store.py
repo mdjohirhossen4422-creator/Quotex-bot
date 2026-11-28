@@ -25,14 +25,10 @@ DB_PATH = os.environ.get("CANDLE_DB", "data/candles.db")
 def is_otc(symbol, info=None):
     info = info or {}
 
-    symbol_text = str(symbol).lower()
-    type_text = str(info.get("type", "")).lower()
-    name_text = str(info.get("name", "")).lower()
-
     return (
-        symbol_text.endswith("_otc")
-        or "otc" in type_text
-        or "otc" in name_text
+        str(symbol).lower().endswith("_otc")
+        or "otc" in str(info.get("type", "")).lower()
+        or "otc" in str(info.get("name", "")).lower()
     )
 
 
@@ -54,8 +50,9 @@ def asset_catalog(instruments, assets=None):
     groups = {}
 
     for symbol in selected:
-        info = instruments.get(symbol, {})
-        category = str(info.get("type", "OTC"))
+        category = str(
+            instruments.get(symbol, {}).get("type", "OTC")
+        )
         groups.setdefault(category, []).append(symbol)
 
     return [
@@ -125,25 +122,27 @@ class CandleStore:
         }
 
         if "source" not in columns:
-            self.db.execute("""
-                ALTER TABLE candles
-                ADD COLUMN source TEXT DEFAULT 'live'
-            """)
+            self.db.execute(
+                "ALTER TABLE candles ADD COLUMN source TEXT DEFAULT 'live'"
+            )
 
         if "feed_id" not in columns:
-            self.db.execute("""
-                ALTER TABLE candles
-                ADD COLUMN feed_id TEXT DEFAULT ''
-            """)
+            self.db.execute(
+                "ALTER TABLE candles ADD COLUMN feed_id TEXT DEFAULT ''"
+            )
 
         self.db.commit()
+
+        print(
+            "CANDLE DATABASE READY:",
+            self.path,
+            flush=True,
+        )
 
     def save_candle(self, asset, period, candle):
         ts, open_, close, high, low = candle
 
         asset = str(asset)
-
-        # FIX: classify_source requires the asset symbol.
         source = str(classify_source(asset))
 
         with self.lock:
@@ -205,44 +204,53 @@ class CandleStore:
         return rows[-1] if rows else None
 
     def series(self, min_candles=0, periods=None):
-        with self.lock:
-            if periods:
-                periods = [int(p) for p in periods]
-                placeholders = ",".join(
-                    "?" for _ in periods
-                )
+        try:
+            with self.lock:
+                if periods:
+                    periods = [int(p) for p in periods]
+                    placeholders = ",".join(
+                        "?" for _ in periods
+                    )
 
-                query = f"""
-                    SELECT asset, period
-                    FROM candles
-                    WHERE period IN ({placeholders})
-                    GROUP BY asset, period
-                    HAVING COUNT(*) >= ?
-                    ORDER BY asset, period
-                """
+                    query = f"""
+                        SELECT asset, period
+                        FROM candles
+                        WHERE period IN ({placeholders})
+                        GROUP BY asset, period
+                        HAVING COUNT(*) >= ?
+                        ORDER BY asset, period
+                    """
 
-                params = periods + [int(min_candles)]
+                    params = periods + [int(min_candles)]
 
-            else:
-                query = """
-                    SELECT asset, period
-                    FROM candles
-                    GROUP BY asset, period
-                    HAVING COUNT(*) >= ?
-                    ORDER BY asset, period
-                """
+                else:
+                    query = """
+                        SELECT asset, period
+                        FROM candles
+                        GROUP BY asset, period
+                        HAVING COUNT(*) >= ?
+                        ORDER BY asset, period
+                    """
 
-                params = [int(min_candles)]
+                    params = [int(min_candles)]
 
-            rows = self.db.execute(
-                query,
-                params,
-            ).fetchall()
+                rows = self.db.execute(
+                    query,
+                    params,
+                ).fetchall()
 
-        return [
-            (row[0], int(row[1]))
-            for row in rows
-        ]
+            return [
+                (row[0], int(row[1]))
+                for row in rows
+            ]
+
+        except Exception as exc:
+            print(
+                "SERIES QUERY ERROR:",
+                repr(exc),
+                flush=True,
+            )
+            return []
 
     def load(self, asset, period=60, limit=5000):
         return self.get_candles(asset, period, limit)
@@ -308,9 +316,7 @@ class MultiFeed:
         self.followed_count = 0
 
         if not self.periods:
-            raise ValueError(
-                "At least one timeframe is required"
-            )
+            raise ValueError("At least one timeframe is required")
 
         self.qx = None
         self.instruments = {}
@@ -332,9 +338,7 @@ class MultiFeed:
                     if asset in self.instruments
                 ]
             else:
-                self.assets = otc_assets(
-                    self.instruments
-                )
+                self.assets = otc_assets(self.instruments)
 
             if not self.assets:
                 raise RuntimeError(
@@ -395,7 +399,6 @@ class MultiFeed:
                     self.qx.close()
                 except Exception:
                     pass
-
             raise
 
     def _save_closed(self, asset, period, candle):
@@ -423,13 +426,7 @@ class MultiFeed:
                 flush=True,
             )
 
-    def _on_tick(
-        self,
-        asset,
-        ts,
-        price,
-        direction=0,
-    ):
+    def _on_tick(self, asset, ts, price, direction=0):
         if self.closed or asset not in self.builders:
             return
 
@@ -451,15 +448,9 @@ class MultiFeed:
             self.last_tick[asset] = (ts, price)
             self.tick_count += 1
 
-            self.store.add_tick(
-                asset,
-                ts,
-                price,
-            )
+            self.store.add_tick(asset, ts, price)
 
-            for period, builder in (
-                self.builders[asset].items()
-            ):
+            for period, builder in self.builders[asset].items():
                 builder.add(ts, price)
 
         except Exception as exc:
@@ -471,21 +462,16 @@ class MultiFeed:
                 flush=True,
             )
 
-    def get_candles(
-        self,
-        asset,
-        period=60,
-        limit=200,
-    ):
+    def get_candles(self, asset, period=60, limit=200):
         saved = self.store.get_candles(
             asset,
             period,
             limit,
         )
 
-        builder = (
-            self.builders.get(asset, {}).get(period)
-        )
+        builder = self.builders.get(
+            asset, {}
+        ).get(period)
 
         if builder and builder.forming:
             current = list(builder.forming)
